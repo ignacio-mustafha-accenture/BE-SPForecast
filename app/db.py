@@ -15,6 +15,7 @@ async def create_pool():
         database=settings.DB_NAME,
         min_size=2,
         max_size=10,
+        ssl="require",
     )
     logger.info("Database pool connected", host=settings.DB_HOST, database=settings.DB_NAME)
 

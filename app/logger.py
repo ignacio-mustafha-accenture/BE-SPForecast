@@ -26,6 +26,8 @@ def serialize(record) -> str:
 
 def setup_logging(log_level: str, log_format: str):
     logger.remove()
+    # Provide defaults so format strings never raise KeyError outside a request context
+    logger.configure(extra={"request_id": "-", "user_id": None, "user_email": None, "action": None, "duration_ms": None})
     if log_format == "json":
         logger.add(sys.stdout, level=log_level, format=serialize, serialize=False)
     else:
