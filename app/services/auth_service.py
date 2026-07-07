@@ -3,24 +3,22 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import asyncpg
+import bcrypt
 from jose import JWTError, jwt
 from loguru import logger
-from passlib.context import CryptContext
 
 import app.db as db
 from app.config import settings
 from app.errors import AppError, ForecastException
 from app.models.auth import UserCreate, UserUpdate
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
 
 def _hash_password(password: str) -> str:
-    return pwd_context.hash(password)
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
 
 
 def _verify_password(plain: str, hashed: str) -> bool:
-    return pwd_context.verify(plain, hashed)
+    return bcrypt.checkpw(plain.encode(), hashed.encode())
 
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:

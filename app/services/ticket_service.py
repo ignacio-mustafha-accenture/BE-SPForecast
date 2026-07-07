@@ -16,9 +16,37 @@ REQUIRED_FIELDS: dict = {
 }
 
 
-async def list_tickets() -> list:
+async def list_tickets(
+    status: str | None = None,
+    type_: str | None = None,
+    q: str | None = None,
+    page: int = 1,
+    page_size: int = 25,
+) -> dict:
+    conditions: list[str] = []
+    params: list = []
+
+    if status:
+        params.append(status)
+        conditions.append(f"t.status = ${len(params)}")
+
+    if type_:
+        params.append(type_)
+        conditions.append(f"t.type = ${len(params)}")
+
+    if q:
+        params.append(f"%{q}%")
+        conditions.append(f"(COALESCE(emp.name, t.nj_name, t.eid) ILIKE ${len(params)} OR t.eid ILIKE ${len(params)})")
+
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    offset = (page - 1) * page_size
+    params.append(page_size)
+    limit_idx = len(params)
+    params.append(offset)
+    offset_idx = len(params)
+
     async with db.pool.acquire() as conn:
-        rows = await conn.fetch("""
+        rows = await conn.fetch(f"""
             SELECT t.id::text AS id, t.type, t.eid, t.detail, t.status,
                    TO_CHAR(t.date,'DD/MM/YY') AS date,
                    COALESCE(e.name, t.created_by::text) AS "by",
@@ -26,11 +54,22 @@ async def list_tickets() -> list:
                    t.client_name, t.offering_type, t.chargeability_pct,
                    t.hours_to_move, t.from_period, t.to_period, t.comments,
                    TO_CHAR(t.start_date,'DD/MM/YY') AS start_date,
-                   TO_CHAR(t.end_date,'DD/MM/YY') AS end_date
-            FROM tickets t LEFT JOIN employees e ON t.created_by=e.eid
+                   TO_CHAR(t.end_date,'DD/MM/YY') AS end_date,
+                   COALESCE(emp.name, t.nj_name) AS eid_name,
+                   COALESCE(emp.country, emp.location) AS eid_country,
+                   COUNT(*) OVER () AS _total
+            FROM tickets t
+            LEFT JOIN employees e ON t.created_by = e.eid
+            LEFT JOIN employees emp ON t.eid = emp.eid
+            {where}
             ORDER BY t.id DESC
-        """)
-    return [dict(r) for r in rows]
+            LIMIT ${limit_idx} OFFSET ${offset_idx}
+        """, *params)
+
+    total = int(rows[0]["_total"]) if rows else 0
+    pages = -(-total // page_size) if page_size > 0 else 0
+    items = [{k: v for k, v in dict(r).items() if k != "_total"} for r in rows]
+    return {"items": items, "total": total, "page": page, "page_size": page_size, "pages": pages}
 
 
 async def create(body: TicketCreate, created_by: str, request_id: str) -> dict:

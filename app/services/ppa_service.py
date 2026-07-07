@@ -5,17 +5,48 @@ from app.errors import AppError, ForecastException
 from app.models.ppa import PPACreate
 
 
-async def list_ppa() -> list:
+async def list_ppa(
+    eid: str | None = None,
+    from_period: str | None = None,
+    page: int = 1,
+    page_size: int = 25,
+) -> dict:
+    conditions: list[str] = []
+    params: list = []
+
+    if eid:
+        params.append(f"%{eid}%")
+        conditions.append(f"p.eid ILIKE ${len(params)}")
+
+    if from_period:
+        params.append(from_period)
+        conditions.append(f"p.from_period = ${len(params)}")
+
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    offset = (page - 1) * page_size
+    params.append(page_size)
+    limit_idx = len(params)
+    params.append(offset)
+    offset_idx = len(params)
+
     async with db.pool.acquire() as conn:
-        rows = await conn.fetch("""
+        rows = await conn.fetch(f"""
             SELECT p.id::text AS id, p.eid, e.name,
                    p.from_period AS "from", p.to_period AS "to",
                    p.hours AS hs, p.reason,
-                   TO_CHAR(p.created_at,'DD/MM/YY') AS date
+                   TO_CHAR(p.created_at,'DD/MM/YY') AS date,
+                   COALESCE(e.country, e.location) AS country,
+                   COUNT(*) OVER () AS _total
             FROM ppa_log p LEFT JOIN employees e ON p.eid=e.eid
+            {where}
             ORDER BY p.created_at DESC
-        """)
-    return [dict(r) for r in rows]
+            LIMIT ${limit_idx} OFFSET ${offset_idx}
+        """, *params)
+
+    total = int(rows[0]["_total"]) if rows else 0
+    pages = -(-total // page_size) if page_size > 0 else 0
+    items = [{k: v for k, v in dict(r).items() if k != "_total"} for r in rows]
+    return {"items": items, "total": total, "page": page, "page_size": page_size, "pages": pages}
 
 
 async def create(body: PPACreate, created_by: str, request_id: str) -> dict:

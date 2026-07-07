@@ -116,6 +116,7 @@ async def get_state(window_offset: int = 0) -> dict:
                 TO_CHAR(fu.next_pto_end,'DD/MM/YY') AS "NextPTOEnd",
                 fu.next_pto_hours AS "NextPTOHours",
                 fu.next_client AS "NextClientPTO",
+                fu.notes AS "Notes",
                 e.new_joiner AS "NewJoiner",
                 TO_CHAR(e.termination_date,'DD/MM/YY') AS "TerminationDate",
                 COALESCE(e.charge, TRUE) AS "Charge"

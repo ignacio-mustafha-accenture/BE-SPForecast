@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Query, Request
 from app.dependencies import require_permission
 from app.models.tickets import TicketCreate, TicketUpdate, TicketAssignEID
 from app.services import ticket_service
@@ -7,8 +7,14 @@ router = APIRouter()
 
 
 @router.get("", dependencies=[require_permission("tickets:read")])
-async def list_tickets():
-    return await ticket_service.list_tickets()
+async def list_tickets(
+    status: str | None = Query(None),
+    type: str | None = Query(None, alias="type"),
+    q: str | None = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(25, ge=1, le=200),
+):
+    return await ticket_service.list_tickets(status=status, type_=type, q=q, page=page, page_size=page_size)
 
 
 @router.post("", status_code=201, dependencies=[require_permission("tickets:create")])

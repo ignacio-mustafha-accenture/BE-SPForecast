@@ -111,3 +111,29 @@ async def set_user_permissions(user_id: int, items: List[UserPermissionItem], re
 async def delete_user_permission(user_id: int, permission_id: int):
     await permission_service.delete_user_permission(user_id, permission_id)
     return {"ok": True}
+
+
+# ---------- Client catalog ----------
+
+class ClientCreate(BaseModel):
+    name: str
+
+
+@router.get("/clients", dependencies=[require_permission("state:read")])
+async def list_clients():
+    async with db.pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT DISTINCT client FROM forecast_update WHERE client IS NOT NULL AND client != '' ORDER BY client"
+        )
+    return {"clients": [r["client"] for r in rows]}
+
+
+@router.post("/clients", dependencies=[require_permission("employees:update")])
+async def add_client(body: ClientCreate):
+    # NOTE: requires a `client_catalog` table to persist pre-defined clients.
+    # Until that table exists, this endpoint validates the input and returns OK.
+    # The GET endpoint already surfaces all distinct clients from forecast_update.
+    name = body.name.strip()
+    if not name:
+        raise ForecastException(AppError.VALIDATION_ERROR, "Client name cannot be empty")
+    return {"ok": True}
