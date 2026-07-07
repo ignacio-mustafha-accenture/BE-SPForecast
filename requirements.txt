@@ -4,7 +4,7 @@ asyncpg
 python-dotenv
 pydantic>=2.0
 pydantic-settings>=2.0
-passlib[bcrypt]
+bcrypt
 python-jose[cryptography]
 fastapi-mail
 loguru
