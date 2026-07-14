@@ -22,6 +22,7 @@ class AppError(Enum):
     TICKET_NOT_FOUND    = ("FO-ERR-030", 404, "Ticket not found")
     TICKET_INVALID_TYPE = ("FO-ERR-031", 400, "Invalid ticket type")
     TICKET_MISSING_FIELDS = ("FO-ERR-032", 400, "Required fields missing for this ticket type")
+    TICKET_INVALID_STATUS = ("FO-ERR-033", 400, "Invalid ticket status transition")
 
     # PPA (040–049)
     PPA_MISSING_FIELDS     = ("FO-ERR-040", 400, "eid, from_period, to_period and hours are required")

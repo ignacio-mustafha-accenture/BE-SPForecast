@@ -6,6 +6,13 @@ from starlette.requests import Request
 
 STRIP_FIELDS = {"password", "new_password", "hashed_password", "token"}
 
+TRACKED_ACTION_PREFIXES = (
+    "Create ticket:",
+    "Approve ticket #",
+    "Reject ticket #",
+    "Create PPA:",
+)
+
 
 def _strip_sensitive(body: dict) -> dict:
     return {k: ("***" if k in STRIP_FIELDS else v) for k, v in body.items()}
@@ -42,12 +49,16 @@ class AuditMiddleware(BaseHTTPMiddleware):
             duration_ms=duration_ms,
         ).info("Response sent", status=response.status_code, path=request.url.path)
 
+        action = getattr(request.state, "action", None)
+        if not action or not any(action.startswith(p) for p in TRACKED_ACTION_PREFIXES):
+            return response
+
         from app.services.audit_service import log as audit_log
 
         await audit_log(
             user_id=user["id"] if user else None,
             user_email=user["email"] if user else None,
-            action=None,
+            action=action,
             method=request.method,
             endpoint=str(request.url.path),
             request_body=request_body,

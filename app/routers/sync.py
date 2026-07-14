@@ -12,6 +12,7 @@ router = APIRouter()
 
 @router.post("", dependencies=[require_permission("sync:run")])
 async def run_sync(request: Request):
+    request.state.action = "Sync data"
     request_id = request.state.request_id
     script = os.path.abspath(settings.LOAD_DATA_SCRIPT)
     cwd = os.path.abspath(settings.LOAD_DATA_CWD)

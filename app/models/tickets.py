@@ -8,7 +8,7 @@ class TicketCreate(BaseModel):
     type: str
     eid: Optional[str] = None
     detail: Optional[str] = None
-    status: str = "Abierto"
+    status: str = "Open"
     nj_name: Optional[str] = None
     start_date: Optional[str] = None
     end_date: Optional[str] = None
@@ -23,6 +23,7 @@ class TicketCreate(BaseModel):
     from_period: Optional[str] = None
     to_period: Optional[str] = None
     comments: Optional[str] = None
+    eid_accenture: Optional[str] = None
 
 
 class TicketUpdate(BaseModel):
@@ -33,9 +34,15 @@ class TicketUpdate(BaseModel):
     start_date: Optional[str] = None
     end_date: Optional[str] = None
     chargeability_pct: Optional[float] = None
+    hours_to_move: Optional[int] = None
     from_period: Optional[str] = None
     to_period: Optional[str] = None
     comments: Optional[str] = None
+    rejection_reason: Optional[str] = None
+
+
+class RejectPayload(BaseModel):
+    reason: str
 
 
 class TicketAssignEID(BaseModel):
@@ -50,3 +57,16 @@ class TicketOut(BaseModel):
     detail: Optional[str]
     status: str
     date: Optional[str]
+    nj_name: Optional[str] = None
+    cl: Optional[int] = None
+    location: Optional[str] = None
+    people_lead: Optional[str] = None
+    client_name: Optional[str] = None
+    offering_type: Optional[str] = None
+    chargeability_pct: Optional[float] = None
+    hours_to_move: Optional[int] = None
+    from_period: Optional[str] = None
+    to_period: Optional[str] = None
+    comments: Optional[str] = None
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
