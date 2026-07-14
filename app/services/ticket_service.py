@@ -109,7 +109,7 @@ async def create(body: TicketCreate, created_by: str, request_id: str) -> dict:
         if not getattr(body, field, None):
             raise ForecastException(AppError.TICKET_MISSING_FIELDS)
 
-    effective_end_date = body.end_date or body.new_end_date
+    effective_end_date = body.end_date or body.new_end_date or body.start_date
 
     logger.bind(action="tickets:create", request_id=request_id).info(
         "Creating ticket", type=body.type, eid=body.eid
