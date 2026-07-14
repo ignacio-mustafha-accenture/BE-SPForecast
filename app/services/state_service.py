@@ -186,8 +186,15 @@ async def get_state(window_offset: int = 0) -> dict:
                    COALESCE(e.name, t.created_by::text) AS "by",
                    t.nj_name, t.cl, t.location, t.people_lead,
                    t.client_name, t.offering_type, t.chargeability_pct,
-                   t.hours_to_move, t.from_period, t.to_period, t.comments
-            FROM tickets t LEFT JOIN employees e ON t.created_by=e.eid
+                   t.hours_to_move, t.from_period, t.to_period, t.comments,
+                   t.start_date::text AS start_date,
+                   t.end_date::text AS end_date,
+                   t.rejection_reason,
+                   COALESCE(emp.name, t.nj_name) AS eid_name,
+                   COALESCE(emp.country, emp.location) AS eid_country
+            FROM tickets t
+            LEFT JOIN employees e   ON t.created_by = e.eid
+            LEFT JOIN employees emp ON t.eid         = emp.eid
             ORDER BY t.id DESC
         """)
         tickets = [dict(r) for r in ticket_rows]
