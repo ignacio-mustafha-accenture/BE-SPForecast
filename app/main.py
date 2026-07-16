@@ -13,7 +13,7 @@ from app.logger import setup_logging
 from app.middleware.audit import AuditMiddleware
 from app.middleware.auth import AuthMiddleware
 from app.middleware.request_id import RequestIDMiddleware
-from app.routers import auth, state, tickets, employees, ppa, recalculate, sync, admin
+from app.routers import auth, state, tickets, employees, ppa, recalculate, sync, admin, chargeability
 from loguru import logger
 
 
@@ -91,3 +91,4 @@ app.include_router(ppa.router,          prefix="/api/ppa",          tags=["ppa"]
 app.include_router(recalculate.router,  prefix="/api/recalculate",  tags=["recalculate"])
 app.include_router(sync.router,         prefix="/api/sync",         tags=["sync"])
 app.include_router(admin.router,        prefix="/api/admin",        tags=["admin"])
+app.include_router(chargeability.router, prefix="/api/employees",    tags=["chargeability"])

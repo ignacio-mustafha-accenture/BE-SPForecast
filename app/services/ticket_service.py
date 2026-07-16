@@ -33,7 +33,7 @@ def _compute_period_name(date_str: str) -> str:
 async def _get_period_for_date(conn, date_str: str) -> str:
     try:
         row = await conn.fetchrow(
-            "SELECT period_name FROM periods WHERE start_date <= $1::date AND end_date >= $1::date LIMIT 1",
+            "SELECT period_name FROM periods WHERE start_date <= $1::text::date AND end_date >= $1::text::date LIMIT 1",
             date_str,
         )
         if row:
@@ -76,18 +76,19 @@ async def list_tickets(
         rows = await conn.fetch(f"""
             SELECT t.id::text AS id, t.type, t.eid, t.detail, t.status,
                    TO_CHAR(t.date,'DD/MM/YY') AS date,
-                   COALESCE(e.name, t.created_by::text) AS "by",
+                   COALESCE(u.full_name, t.created_by) AS "by",
                    t.nj_name, t.cl, t.location, t.people_lead,
                    t.client_name, t.offering_type, t.chargeability_pct,
                    t.hours_to_move, t.from_period, t.to_period, t.comments,
                    t.start_date::text AS start_date,
                    t.end_date::text AS end_date,
                    t.rejection_reason,
+                   COALESCE(t.scenario_type, 'assumption') AS scenario_type,
                    COALESCE(emp.name, t.nj_name) AS eid_name,
                    COALESCE(emp.country, emp.location) AS eid_country,
                    COUNT(*) OVER () AS _total
             FROM tickets t
-            LEFT JOIN employees e ON t.created_by = e.eid
+            LEFT JOIN users u ON u.email = t.created_by
             LEFT JOIN employees emp ON t.eid = emp.eid
             {where}
             ORDER BY t.id DESC
@@ -98,6 +99,55 @@ async def list_tickets(
     pages = -(-total // page_size) if page_size > 0 else 0
     items = [{k: v for k, v in dict(r).items() if k != "_total"} for r in rows]
     return {"items": items, "total": total, "page": page, "page_size": page_size, "pages": pages}
+
+
+async def _fetch_full_ticket(conn, ticket_id: str) -> dict:
+    row = await conn.fetchrow("""
+        SELECT t.id::text AS id, t.type, t.eid, t.detail, t.status,
+               TO_CHAR(t.date,'DD/MM/YY') AS date,
+               COALESCE(e.name, u.full_name, t.created_by::text) AS "by",
+               t.nj_name, t.cl, t.location, t.people_lead,
+               t.client_name, t.offering_type, t.chargeability_pct,
+               t.hours_to_move, t.from_period, t.to_period, t.comments,
+               t.start_date::text AS start_date,
+               t.end_date::text AS end_date,
+               t.rejection_reason,
+               COALESCE(t.scenario_type, 'assumption') AS scenario_type,
+               COALESCE(emp.name, t.nj_name) AS eid_name,
+               COALESCE(emp.country, emp.location) AS eid_country
+        FROM tickets t
+        LEFT JOIN employees e   ON t.created_by = e.eid
+        LEFT JOIN users u       ON u.email = t.created_by
+        LEFT JOIN employees emp ON t.eid = emp.eid
+        WHERE t.id = $1
+    """, int(ticket_id))
+    return dict(row)
+
+
+async def get_ticket(ticket_id: int) -> dict:
+    async with db.pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT t.id::text AS id, t.type, t.eid, t.detail, t.status,
+                   TO_CHAR(t.date,'DD/MM/YY') AS date,
+                   COALESCE(e.name, u.full_name, t.created_by::text) AS "by",
+                   t.nj_name, t.cl, t.location, t.people_lead,
+                   t.client_name, t.offering_type, t.chargeability_pct,
+                   t.hours_to_move, t.from_period, t.to_period, t.comments,
+                   t.start_date::text AS start_date,
+                   t.end_date::text AS end_date,
+                   t.rejection_reason,
+                   COALESCE(t.scenario_type, 'assumption') AS scenario_type,
+                   COALESCE(emp.name, t.nj_name) AS eid_name,
+                   COALESCE(emp.country, emp.location) AS eid_country
+            FROM tickets t
+            LEFT JOIN employees e   ON t.created_by = e.eid
+            LEFT JOIN users u       ON u.email = t.created_by
+            LEFT JOIN employees emp ON t.eid = emp.eid
+            WHERE t.id = $1
+        """, ticket_id)
+        if not row:
+            raise ForecastException(AppError.TICKET_NOT_FOUND)
+        return dict(row)
 
 
 async def create(body: TicketCreate, created_by: str, request_id: str) -> dict:
@@ -126,22 +176,15 @@ async def create(body: TicketCreate, created_by: str, request_id: str) -> dict:
                             logger.bind(request_id=request_id).warning("Employee not found", eid=body.eid)
                             raise ForecastException(AppError.EMPLOYEE_NOT_FOUND)
 
-                    ticket = await conn.fetchrow(
+                    ticket_row = await conn.fetchrow(
                         """
                         INSERT INTO tickets (
                             type, eid, detail, status, date, created_by,
                             nj_name, start_date, end_date, cl, location, people_lead,
                             client_name, offering_type, chargeability_pct,
-                            hours_to_move, from_period, to_period, comments
-                        ) VALUES ($1,$2,$3,$4,CURRENT_DATE,$5,$6,$7::text::date,$8::text::date,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
-                        RETURNING id::text, type, eid, detail, status,
-                                  TO_CHAR(date,'DD/MM/YY') AS date,
-                                  nj_name, cl, location, people_lead,
-                                  client_name, offering_type, chargeability_pct,
-                                  hours_to_move, from_period, to_period, comments,
-                                  start_date::text AS start_date,
-                                  end_date::text AS end_date,
-                                  rejection_reason
+                            hours_to_move, from_period, to_period, comments, scenario_type
+                        ) VALUES ($1,$2,$3,$4,CURRENT_DATE,$5,$6,$7::text::date,$8::text::date,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+                        RETURNING id::text
                         """,
                         body.type, body.eid or None, body.detail, body.status, created_by or None,
                         body.nj_name or None, body.start_date or None, effective_end_date or None,
@@ -149,15 +192,17 @@ async def create(body: TicketCreate, created_by: str, request_id: str) -> dict:
                         body.client_name or None, body.offering_type or None,
                         body.chargeability_pct, body.hours_to_move, body.from_period or None,
                         body.to_period or None, body.comments or None,
+                        body.scenario_type or "assumption",
                     )
 
                     await _apply_side_effects(conn, body, effective_end_date, created_by, request_id)
+                    ticket = await _fetch_full_ticket(conn, ticket_row["id"])
 
                     duration = int((time.monotonic() - start) * 1000)
                     logger.bind(action="tickets:create", request_id=request_id, duration_ms=duration).info(
                         "Ticket created", ticket_id=ticket["id"]
                     )
-                    return dict(ticket)
+                    return ticket
 
                 except ForecastException:
                     raise
@@ -184,12 +229,14 @@ async def _apply_side_effects(conn, body: TicketCreate, effective_end_date, crea
                 roll_on           = COALESCE($3::text::date, roll_on),
                 roll_off          = COALESCE($4::text::date, roll_off),
                 chargeability_pct = COALESCE($5, chargeability_pct),
+                scenario_type     = $7,
                 updated_at        = NOW()
             WHERE eid = $6
             """,
             body.client_name or None, body.offering_type or None,
             body.start_date or None, effective_end_date or None,
             body.chargeability_pct, body.eid,
+            body.scenario_type or "assumption",
         )
         try:
             await _recalculate_all_periods_for_eid(conn, body.eid, request_id)
@@ -204,6 +251,8 @@ async def _apply_side_effects(conn, body: TicketCreate, effective_end_date, crea
         if body.chargeability_pct is not None:
             updates.append(f"chargeability_pct = ${len(vals)+1}")
             vals.append(body.chargeability_pct)
+        updates.append(f"scenario_type = ${len(vals)+1}")
+        vals.append(body.scenario_type or "assumption")
         if updates:
             updates.append("updated_at = NOW()")
             vals.append(body.eid)
@@ -289,35 +338,17 @@ async def update(ticket_id: int, body: TicketUpdate, request_id: str) -> dict:
     async with db.pool.acquire() as conn:
         try:
             row = await conn.fetchrow(
-                f"UPDATE tickets SET {set_clause} WHERE id=${len(vals)}"
-                " RETURNING id::text, type, eid, detail, status,"
-                " TO_CHAR(date,'DD/MM/YY') AS date,"
-                " nj_name, cl, location, people_lead,"
-                " client_name, offering_type, chargeability_pct,"
-                " hours_to_move, from_period, to_period, comments,"
-                " start_date::text AS start_date,"
-                " end_date::text AS end_date,"
-                " rejection_reason",
+                f"UPDATE tickets SET {set_clause} WHERE id=${len(vals)} RETURNING id::text",
                 *vals,
             )
+            if not row:
+                raise ForecastException(AppError.TICKET_NOT_FOUND)
+            return await _fetch_full_ticket(conn, row["id"])
+        except ForecastException:
+            raise
         except Exception as e:
             logger.bind(request_id=request_id).exception("Unexpected error updating ticket")
             raise ForecastException(AppError.INTERNAL_ERROR, str(e))
-    if not row:
-        raise ForecastException(AppError.TICKET_NOT_FOUND)
-    return dict(row)
-
-
-_TICKET_RETURNING = (
-    " RETURNING id::text, type, eid, detail, status,"
-    " TO_CHAR(date,'DD/MM/YY') AS date,"
-    " nj_name, cl, location, people_lead,"
-    " client_name, offering_type, chargeability_pct,"
-    " hours_to_move, from_period, to_period, comments,"
-    " start_date::text AS start_date,"
-    " end_date::text AS end_date,"
-    " rejection_reason"
-)
 
 
 async def approve_ticket(ticket_id: int, request_id: str) -> dict:
@@ -329,17 +360,17 @@ async def approve_ticket(ticket_id: int, request_id: str) -> dict:
             if current["status"] != "Open":
                 raise ForecastException(AppError.TICKET_INVALID_STATUS)
             row = await conn.fetchrow(
-                "UPDATE tickets SET status='Approved' WHERE id=$1" + _TICKET_RETURNING,
+                "UPDATE tickets SET status='Approved' WHERE id=$1 RETURNING id::text",
                 ticket_id,
             )
+            if not row:
+                raise ForecastException(AppError.TICKET_NOT_FOUND)
+            return await _fetch_full_ticket(conn, row["id"])
         except ForecastException:
             raise
         except Exception as e:
             logger.bind(request_id=request_id).exception("Unexpected error approving ticket")
             raise ForecastException(AppError.INTERNAL_ERROR, str(e))
-    if not row:
-        raise ForecastException(AppError.TICKET_NOT_FOUND)
-    return dict(row)
 
 
 async def reject_ticket(ticket_id: int, reason: str, request_id: str) -> dict:
@@ -353,17 +384,17 @@ async def reject_ticket(ticket_id: int, reason: str, request_id: str) -> dict:
             if current["status"] != "Open":
                 raise ForecastException(AppError.TICKET_INVALID_STATUS)
             row = await conn.fetchrow(
-                "UPDATE tickets SET status='Rejected', rejection_reason=$2 WHERE id=$1" + _TICKET_RETURNING,
+                "UPDATE tickets SET status='Rejected', rejection_reason=$2 WHERE id=$1 RETURNING id::text",
                 ticket_id, reason,
             )
+            if not row:
+                raise ForecastException(AppError.TICKET_NOT_FOUND)
+            return await _fetch_full_ticket(conn, row["id"])
         except ForecastException:
             raise
         except Exception as e:
             logger.bind(request_id=request_id).exception("Unexpected error rejecting ticket")
             raise ForecastException(AppError.INTERNAL_ERROR, str(e))
-    if not row:
-        raise ForecastException(AppError.TICKET_NOT_FOUND)
-    return dict(row)
 
 
 async def assign_eid(ticket_id: int, new_eid: str, new_name, request_id: str) -> dict:

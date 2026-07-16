@@ -183,18 +183,20 @@ async def get_state(window_offset: int = 0) -> dict:
         ticket_rows = await conn.fetch("""
             SELECT t.id::text AS id, t.type, t.eid, t.detail, t.status,
                    TO_CHAR(t.date,'DD/MM/YY') AS date,
-                   COALESCE(e.name, t.created_by::text) AS "by",
+                   COALESCE(e.name, u.full_name, t.created_by::text) AS "by",
                    t.nj_name, t.cl, t.location, t.people_lead,
                    t.client_name, t.offering_type, t.chargeability_pct,
                    t.hours_to_move, t.from_period, t.to_period, t.comments,
                    t.start_date::text AS start_date,
                    t.end_date::text AS end_date,
                    t.rejection_reason,
+                   COALESCE(t.scenario_type, 'assumption') AS scenario_type,
                    COALESCE(emp.name, t.nj_name) AS eid_name,
                    COALESCE(emp.country, emp.location) AS eid_country
             FROM tickets t
             LEFT JOIN employees e   ON t.created_by = e.eid
-            LEFT JOIN employees emp ON t.eid         = emp.eid
+            LEFT JOIN users u       ON u.email = t.created_by
+            LEFT JOIN employees emp ON t.eid = emp.eid
             ORDER BY t.id DESC
         """)
         tickets = [dict(r) for r in ticket_rows]

@@ -23,7 +23,14 @@ async def list_tickets(
 async def create_ticket(body: TicketCreate, request: Request):
     request.state.action = f"Create ticket: {body.type}"
     user = request.state.user
-    return await ticket_service.create(body, user.get("eid"), request.state.request_id)
+    created_by = user.get("email") or None
+    return await ticket_service.create(body, created_by, request.state.request_id)
+
+
+@router.get("/{ticket_id}", dependencies=[require_permission("tickets:read")])
+async def get_ticket(ticket_id: int, request: Request):
+    request.state.action = f"Get ticket #{ticket_id}"
+    return await ticket_service.get_ticket(ticket_id)
 
 
 @router.patch("/{ticket_id}/approve", dependencies=[require_permission("tickets:approve")])

@@ -2,6 +2,7 @@ from typing import Optional
 from pydantic import BaseModel
 
 VALID_TICKET_TYPES = {"newproj", "ongoing", "pto", "sick", "nj", "baja"}
+VALID_SCENARIO_TYPES = {"assumption", "effective"}
 
 
 class TicketCreate(BaseModel):
@@ -24,6 +25,7 @@ class TicketCreate(BaseModel):
     to_period: Optional[str] = None
     comments: Optional[str] = None
     eid_accenture: Optional[str] = None
+    scenario_type: str = "assumption"
 
 
 class TicketUpdate(BaseModel):
@@ -70,3 +72,4 @@ class TicketOut(BaseModel):
     comments: Optional[str] = None
     start_date: Optional[str] = None
     end_date: Optional[str] = None
+    scenario_type: Optional[str] = None
