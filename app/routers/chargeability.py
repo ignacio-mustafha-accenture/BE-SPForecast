@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Request
 from app.dependencies import require_permission
-from app.models.chargeability import ChargeabilityBlockCreate
+from app.models.chargeability import ChargeabilityBlockCreate, EffectivizePayload
 from app.services import chargeability_service
 
 router = APIRouter()
@@ -32,3 +32,13 @@ async def create_chargeability_block(eid: str, body: ChargeabilityBlockCreate, r
 async def delete_chargeability_block(eid: str, block_id: int, request: Request):
     request.state.action = f"Delete chargeability block #{block_id}: {eid}"
     await chargeability_service.delete_block(block_id, eid)
+
+
+@router.post(
+    "/{eid}/effectivize",
+    dependencies=[require_permission("employees:update")],
+)
+async def effectivize_employee(eid: str, body: EffectivizePayload, request: Request):
+    periods_label = ','.join(body.period_names) if body.period_names else 'all'
+    request.state.action = f"Effectivize employee: {eid} periods={periods_label}"
+    return await chargeability_service.effectivize_employee(eid, body.period_names, body.chargeability_pct)

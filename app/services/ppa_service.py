@@ -77,20 +77,16 @@ async def create(body: PPACreate, created_by: str, request_id: str) -> dict:
                 body.hours, body.reason or None, created_by or None,
             )
 
-            await conn.execute(
-                "UPDATE forecast_periods SET chg=chg-$1 WHERE eid=$2 AND period_name=$3",
-                body.hours, body.eid, body.from_period,
-            )
-
-            await conn.execute(
-                """
-                INSERT INTO forecast_periods (eid, period_name, chg, sah, chg_pct)
-                VALUES ($1,$2,$3,0,NULL)
-                ON CONFLICT (eid, period_name)
-                DO UPDATE SET chg = forecast_periods.chg + EXCLUDED.chg
-                """,
-                body.eid, body.to_period, body.hours,
-            )
+            # Recalculate both periods via stored proc so ppa_adj is correctly populated
+            for period in (body.from_period, body.to_period):
+                try:
+                    await conn.execute(
+                        "SELECT recalculate_forecast_period($1,$2)", body.eid, period
+                    )
+                except Exception as e:
+                    logger.bind(request_id=request_id).warning(
+                        "Recalculate failed after PPA", period=period, error=str(e)
+                    )
 
     duration = int((time.monotonic() - start) * 1000)
     logger.bind(action="ppa:create", request_id=request_id, duration_ms=duration).info(

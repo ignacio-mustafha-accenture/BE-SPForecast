@@ -8,6 +8,7 @@ class ChargeabilityBlockCreate(BaseModel):
     end_date: date
     chargeability_pct: float
     scenario_type: str = "assumption"
+    effectivization_date: Optional[date] = None
 
     @field_validator("chargeability_pct")
     @classmethod
@@ -24,6 +25,18 @@ class ChargeabilityBlockCreate(BaseModel):
         return v
 
 
+class EffectivizePayload(BaseModel):
+    period_names: Optional[list[str]] = None
+    chargeability_pct: float
+
+    @field_validator("chargeability_pct")
+    @classmethod
+    def pct_range(cls, v: float) -> float:
+        if not (0 <= v <= 100):
+            raise ValueError("chargeability_pct must be between 0 and 100")
+        return v
+
+
 class ChargeabilityBlockResponse(BaseModel):
     id: int
     eid: str
@@ -34,3 +47,4 @@ class ChargeabilityBlockResponse(BaseModel):
     end_date: str
     created_by: Optional[str] = None
     created_at: str
+    effectivization_date: Optional[str] = None

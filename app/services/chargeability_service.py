@@ -15,6 +15,7 @@ def _serialize_block(row: dict) -> dict:
         "end_date": row["end_date"].isoformat() if row["end_date"] else None,
         "created_by": row["created_by"],
         "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+        "effectivization_date": row["effectivization_date"].isoformat() if row.get("effectivization_date") else None,
     }
 
 
@@ -34,6 +35,12 @@ async def create_block(eid: str, block: ChargeabilityBlockCreate, created_by: st
     days_diff = (block.end_date - block.start_date).days
     if days_diff > 14:
         raise ForecastException(AppError.VALIDATION_ERROR, "El bloque no puede superar 14 días")
+
+    if block.scenario_type == "assumption" and not block.effectivization_date:
+        raise ForecastException(AppError.VALIDATION_ERROR, "effectivization_date is required for assumption blocks")
+
+    if block.effectivization_date and block.effectivization_date > block.end_date:
+        raise ForecastException(AppError.VALIDATION_ERROR, "effectivization_date must be <= end_date")
 
     async with db.pool.acquire() as conn:
         # Verify employee exists
@@ -68,38 +75,74 @@ async def create_block(eid: str, block: ChargeabilityBlockCreate, created_by: st
             row = await conn.fetchrow(
                 """
                 INSERT INTO chargeability_blocks
-                    (eid, period_name, chargeability_pct, scenario_type, start_date, end_date, created_by)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    (eid, period_name, chargeability_pct, scenario_type,
+                     start_date, end_date, created_by, effectivization_date)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                 RETURNING *
                 """,
                 eid, period_name, block.chargeability_pct, block.scenario_type,
                 block.start_date, block.end_date, created_by,
+                block.effectivization_date or None,
             )
 
-            # Recalculate the affected period using the block's chargeability_pct
+            # Recalculate the affected period via stored proc (includes all split fields)
             if period_name:
                 try:
-                    fp = await conn.fetchrow(
-                        "SELECT sah FROM forecast_periods WHERE eid=$1 AND period_name=$2",
-                        eid, period_name,
+                    await conn.execute(
+                        "SELECT recalculate_forecast_period($1,$2)", eid, period_name
                     )
-                    if fp and fp["sah"]:
-                        sah = float(fp["sah"])
-                        chg = round(sah * block.chargeability_pct / 100, 2)
-                        chg_pct = round(block.chargeability_pct)
-                        await conn.execute(
-                            """
-                            INSERT INTO forecast_periods (eid, period_name, chg, sah, chg_pct)
-                            VALUES ($1, $2, $3, $4, $5)
-                            ON CONFLICT (eid, period_name)
-                            DO UPDATE SET chg=$3, chg_pct=$5
-                            """,
-                            eid, period_name, chg, sah, chg_pct,
-                        )
                 except Exception as e:
                     logger.warning("Recalculate failed after chargeability block create", error=str(e))
 
             return _serialize_block(dict(row))
+
+
+async def effectivize_employee(eid: str, period_names: list[str] | None, chargeability_pct: float) -> dict:
+    async with db.pool.acquire() as conn:
+        # Commit the block update in its own transaction before recalculating.
+        # Recalculate must run outside the transaction: if the stored proc raises a
+        # PostgreSQL exception, the connection enters ABORTED state and the subsequent
+        # COMMIT becomes a ROLLBACK, silently undoing the UPDATE.
+        async with conn.transaction():
+            if period_names:
+                rows = await conn.fetch(
+                    """
+                    UPDATE chargeability_blocks
+                    SET scenario_type = 'effective',
+                        effectivization_date = NULL,
+                        chargeability_pct = $3
+                    WHERE eid = $1 AND scenario_type = 'assumption'
+                      AND period_name = ANY($2::text[])
+                    RETURNING period_name
+                    """,
+                    eid, period_names, chargeability_pct,
+                )
+            else:
+                rows = await conn.fetch(
+                    """
+                    UPDATE chargeability_blocks
+                    SET scenario_type = 'effective',
+                        effectivization_date = NULL,
+                        chargeability_pct = $2
+                    WHERE eid = $1 AND scenario_type = 'assumption'
+                    RETURNING period_name
+                    """,
+                    eid, chargeability_pct,
+                )
+
+        updated = len(rows)
+        affected = {r["period_name"] for r in rows if r["period_name"]}
+
+        # Recalculate outside the transaction — same pattern as recalculate_service.py
+        for pname in affected:
+            try:
+                await conn.execute(
+                    "SELECT recalculate_forecast_period($1,$2)", eid, pname
+                )
+            except Exception as e:
+                logger.warning("Recalculate failed after effectivize", error=str(e))
+
+    return {"ok": True, "updated": updated}
 
 
 async def delete_block(block_id: int, eid: str) -> None:
