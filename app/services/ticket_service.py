@@ -23,14 +23,15 @@ def _normalize_nj_eid(name: str) -> str:
     return "NJ_" + stripped.lower().replace(" ", ".")
 
 
-def _compute_period_name(date_str: str) -> str:
+def _compute_period_name(date_val) -> str:
     from datetime import date as _date
     MN = ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"]
-    d = _date.fromisoformat(date_str)
+    d = _date.fromisoformat(date_val) if isinstance(date_val, str) else date_val
     return f"{MN[d.month - 1]}-P{1 if d.day <= 15 else 2}"
 
 
-async def _get_period_for_date(conn, date_str: str) -> str:
+async def _get_period_for_date(conn, date_val) -> str:
+    date_str = date_val.isoformat() if hasattr(date_val, "isoformat") else date_val
     try:
         row = await conn.fetchrow(
             "SELECT period_name FROM periods WHERE start_date <= $1::text::date AND end_date >= $1::text::date LIMIT 1",
@@ -40,7 +41,7 @@ async def _get_period_for_date(conn, date_str: str) -> str:
             return row["period_name"]
     except Exception:
         pass
-    return _compute_period_name(date_str)
+    return _compute_period_name(date_val)
 
 
 async def list_tickets(
@@ -84,6 +85,7 @@ async def list_tickets(
                    t.end_date::text AS end_date,
                    t.rejection_reason,
                    COALESCE(t.scenario_type, 'assumption') AS scenario_type,
+                   t.effectivization_date::text AS effectivization_date,
                    COALESCE(emp.name, t.nj_name) AS eid_name,
                    COALESCE(emp.country, emp.location) AS eid_country,
                    COUNT(*) OVER () AS _total
@@ -113,6 +115,7 @@ async def _fetch_full_ticket(conn, ticket_id: str) -> dict:
                t.end_date::text AS end_date,
                t.rejection_reason,
                COALESCE(t.scenario_type, 'assumption') AS scenario_type,
+               t.effectivization_date::text AS effectivization_date,
                COALESCE(emp.name, t.nj_name) AS eid_name,
                COALESCE(emp.country, emp.location) AS eid_country
         FROM tickets t
@@ -137,6 +140,7 @@ async def get_ticket(ticket_id: int) -> dict:
                    t.end_date::text AS end_date,
                    t.rejection_reason,
                    COALESCE(t.scenario_type, 'assumption') AS scenario_type,
+                   t.effectivization_date::text AS effectivization_date,
                    COALESCE(emp.name, t.nj_name) AS eid_name,
                    COALESCE(emp.country, emp.location) AS eid_country
             FROM tickets t
@@ -159,7 +163,20 @@ async def create(body: TicketCreate, created_by: str, request_id: str) -> dict:
         if not getattr(body, field, None):
             raise ForecastException(AppError.TICKET_MISSING_FIELDS)
 
+    if body.scenario_type == "assumption" and not body.effectivization_date:
+        raise ForecastException(AppError.VALIDATION_ERROR, "effectivization_date is required for assumption tickets")
+
     effective_end_date = body.end_date or body.new_end_date or body.start_date
+
+    if body.effectivization_date and effective_end_date:
+        from datetime import date as _date
+        try:
+            eff_date = _date.fromisoformat(body.effectivization_date)
+            end_date = _date.fromisoformat(effective_end_date)
+            if eff_date > end_date:
+                raise ForecastException(AppError.VALIDATION_ERROR, "effectivization_date must be <= end_date")
+        except ValueError:
+            raise ForecastException(AppError.VALIDATION_ERROR, "Invalid effectivization_date format (use YYYY-MM-DD)")
 
     logger.bind(action="tickets:create", request_id=request_id).info(
         "Creating ticket", type=body.type, eid=body.eid
@@ -182,8 +199,10 @@ async def create(body: TicketCreate, created_by: str, request_id: str) -> dict:
                             type, eid, detail, status, date, created_by,
                             nj_name, start_date, end_date, cl, location, people_lead,
                             client_name, offering_type, chargeability_pct,
-                            hours_to_move, from_period, to_period, comments, scenario_type
-                        ) VALUES ($1,$2,$3,$4,CURRENT_DATE,$5,$6,$7::text::date,$8::text::date,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+                            hours_to_move, from_period, to_period, comments,
+                            scenario_type, effectivization_date
+                        ) VALUES ($1,$2,$3,$4,CURRENT_DATE,$5,$6,$7::text::date,$8::text::date,
+                                  $9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20::text::date)
                         RETURNING id::text
                         """,
                         body.type, body.eid or None, body.detail, body.status, created_by or None,
@@ -193,6 +212,7 @@ async def create(body: TicketCreate, created_by: str, request_id: str) -> dict:
                         body.chargeability_pct, body.hours_to_move, body.from_period or None,
                         body.to_period or None, body.comments or None,
                         body.scenario_type or "assumption",
+                        body.effectivization_date or None,
                     )
 
                     await _apply_side_effects(conn, body, effective_end_date, created_by, request_id)
@@ -220,76 +240,7 @@ async def create(body: TicketCreate, created_by: str, request_id: str) -> dict:
 
 
 async def _apply_side_effects(conn, body: TicketCreate, effective_end_date, created_by, request_id: str):
-    if body.type == "newproj" and body.eid:
-        await conn.execute(
-            """
-            UPDATE forecast_update SET
-                client            = COALESCE($1, client),
-                offering          = COALESCE($2, offering),
-                roll_on           = COALESCE($3::text::date, roll_on),
-                roll_off          = COALESCE($4::text::date, roll_off),
-                chargeability_pct = COALESCE($5, chargeability_pct),
-                scenario_type     = $7,
-                updated_at        = NOW()
-            WHERE eid = $6
-            """,
-            body.client_name or None, body.offering_type or None,
-            body.start_date or None, effective_end_date or None,
-            body.chargeability_pct, body.eid,
-            body.scenario_type or "assumption",
-        )
-        try:
-            await _recalculate_all_periods_for_eid(conn, body.eid, request_id)
-        except Exception as e:
-            logger.bind(request_id=request_id).warning("Recalculate skipped after newproj update", error=str(e))
-
-    elif body.type == "ongoing" and body.eid:
-        updates, vals = [], []
-        if effective_end_date:
-            updates.append(f"roll_off = ${len(vals)+1}::text::date")
-            vals.append(effective_end_date)
-        if body.chargeability_pct is not None:
-            updates.append(f"chargeability_pct = ${len(vals)+1}")
-            vals.append(body.chargeability_pct)
-        updates.append(f"scenario_type = ${len(vals)+1}")
-        vals.append(body.scenario_type or "assumption")
-        if updates:
-            updates.append("updated_at = NOW()")
-            vals.append(body.eid)
-            await conn.execute(
-                f"UPDATE forecast_update SET {', '.join(updates)} WHERE eid = ${len(vals)}",
-                *vals,
-            )
-            try:
-                await _recalculate_all_periods_for_eid(conn, body.eid, request_id)
-            except Exception as e:
-                logger.bind(request_id=request_id).warning("Recalculate skipped after ongoing update", error=str(e))
-
-    elif body.type == "pto" and body.eid and body.start_date and effective_end_date:
-        period_name = await _get_period_for_date(conn, body.start_date)
-        await conn.execute(
-            """
-            INSERT INTO absences (eid, period_name, type, start_date, end_date, created_at, created_by)
-            VALUES ($1, $2, 'PTO', $3::text::date, $4::text::date, NOW(), $5)
-            """,
-            body.eid, period_name, body.start_date, effective_end_date, created_by or None,
-        )
-
-    elif body.type == "sick" and body.eid and body.start_date and effective_end_date:
-        period_name = await _get_period_for_date(conn, body.start_date)
-        await conn.execute(
-            """
-            INSERT INTO absences (eid, period_name, type, start_date, end_date, created_at, created_by)
-            VALUES ($1, $2, 'SICK', $3::text::date, $4::text::date, NOW(), $5)
-            """,
-            body.eid, period_name, body.start_date, effective_end_date, created_by or None,
-        )
-        try:
-            await _recalculate_all_periods_for_eid(conn, body.eid, request_id)
-        except Exception as e:
-            logger.bind(request_id=request_id).warning("Recalculate skipped after sick insert", error=str(e))
-
-    elif body.type == "nj" and body.nj_name:
+    if body.type == "nj" and body.nj_name:
         nj_eid = body.eid_accenture or _normalize_nj_eid(body.nj_name)
         exists = await conn.fetchrow("SELECT eid FROM employees WHERE eid=$1", nj_eid)
         if not exists:
@@ -302,11 +253,90 @@ async def _apply_side_effects(conn, body: TicketCreate, effective_end_date, crea
                 body.cl, body.start_date or None, body.people_lead or None,
             )
 
-    elif body.type == "baja" and body.eid and effective_end_date:
+
+async def _apply_approval_side_effects(conn, ticket: dict, request_id: str):
+    t_type = ticket.get("type")
+    eid = ticket.get("eid")
+    if not eid:
+        return
+
+    if t_type in ("sick", "pto"):
+        from datetime import date as _d
+        start_date = ticket.get("start_date")
+        end_date = ticket.get("end_date") or start_date
+        if not start_date:
+            return
+        if isinstance(start_date, str):
+            start_date = _d.fromisoformat(start_date)
+        if isinstance(end_date, str):
+            end_date = _d.fromisoformat(end_date)
+        emp = await conn.fetchrow("SELECT COALESCE(country, location) AS country FROM employees WHERE eid=$1", eid)
+        country = emp["country"] if emp else None
+        if country:
+            cal_row = await conn.fetchrow(
+                """
+                SELECT COALESCE(SUM(CASE WHEN is_working_day THEN 8 ELSE 0 END), 0) AS hrs,
+                       COUNT(*) AS days
+                FROM calendar
+                WHERE country=$1 AND date BETWEEN $2 AND $3
+                """,
+                country, start_date, end_date,
+            )
+            hours = int(cal_row["hrs"]) if cal_row and int(cal_row["hrs"]) > 0 else (end_date - start_date).days * 8 + 8
+            days = int(cal_row["days"]) if cal_row and int(cal_row["days"]) > 0 else (end_date - start_date).days + 1
+        else:
+            days = (end_date - start_date).days + 1
+            hours = days * 8
+        period_name = await _get_period_for_date(conn, start_date)
+        absence_type = "SICK" if t_type == "sick" else "PTO"
         await conn.execute(
-            "UPDATE employees SET termination_date=$1::text::date WHERE eid=$2",
-            effective_end_date, body.eid,
+            "INSERT INTO absences (eid, period_name, type, start_date, end_date, days, hours) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+            eid, period_name, absence_type, start_date, end_date, days, hours,
         )
+        logger.bind(request_id=request_id).info(
+            "Absence inserted on ticket approval", eid=eid, type=absence_type, hours=hours
+        )
+
+    elif t_type == "newproj":
+        await conn.execute(
+            """
+            INSERT INTO forecast_update (eid, client, offering, roll_on, roll_off, chargeability_pct, updated_at)
+            VALUES ($1,$2,$3,$4::date,$5::date,$6,NOW())
+            ON CONFLICT (eid) DO UPDATE SET
+                client=COALESCE($2,forecast_update.client),
+                offering=COALESCE($3,forecast_update.offering),
+                roll_on=COALESCE($4::date,forecast_update.roll_on),
+                roll_off=COALESCE($5::date,forecast_update.roll_off),
+                chargeability_pct=COALESCE($6,forecast_update.chargeability_pct),
+                updated_at=NOW()
+            """,
+            eid,
+            ticket.get("client_name"), ticket.get("offering_type"),
+            ticket.get("start_date"), ticket.get("end_date"),
+            ticket.get("chargeability_pct"),
+        )
+        logger.bind(request_id=request_id).info("newproj applied to forecast_update", eid=eid)
+
+    elif t_type == "ongoing":
+        await conn.execute(
+            """
+            UPDATE forecast_update SET
+                roll_off=COALESCE($2::date, roll_off),
+                chargeability_pct=COALESCE($3, chargeability_pct),
+                updated_at=NOW()
+            WHERE eid=$1
+            """,
+            eid, ticket.get("end_date"), ticket.get("chargeability_pct"),
+        )
+        logger.bind(request_id=request_id).info("ongoing applied to forecast_update", eid=eid)
+
+    elif t_type == "baja":
+        end_date = ticket.get("end_date")
+        if end_date:
+            await conn.execute(
+                "UPDATE employees SET termination_date=$2::date WHERE eid=$1", eid, end_date
+            )
+        logger.bind(request_id=request_id).info("baja applied to employees", eid=eid)
 
 
 async def _recalculate_all_periods_for_eid(conn, eid: str, request_id: str):
@@ -360,12 +390,16 @@ async def approve_ticket(ticket_id: int, request_id: str) -> dict:
             if current["status"] != "Open":
                 raise ForecastException(AppError.TICKET_INVALID_STATUS)
             row = await conn.fetchrow(
-                "UPDATE tickets SET status='Approved' WHERE id=$1 RETURNING id::text",
+                "UPDATE tickets SET status='Approved' WHERE id=$1 RETURNING id::text, eid",
                 ticket_id,
             )
             if not row:
                 raise ForecastException(AppError.TICKET_NOT_FOUND)
-            return await _fetch_full_ticket(conn, row["id"])
+            ticket = await _fetch_full_ticket(conn, row["id"])
+            await _apply_approval_side_effects(conn, ticket, request_id)
+            if row["eid"]:
+                await _recalculate_all_periods_for_eid(conn, row["eid"], request_id)
+            return ticket
         except ForecastException:
             raise
         except Exception as e:

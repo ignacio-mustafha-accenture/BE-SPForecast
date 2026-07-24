@@ -26,6 +26,7 @@ class TicketCreate(BaseModel):
     comments: Optional[str] = None
     eid_accenture: Optional[str] = None
     scenario_type: str = "assumption"
+    effectivization_date: Optional[str] = None
 
 
 class TicketUpdate(BaseModel):
@@ -73,3 +74,4 @@ class TicketOut(BaseModel):
     start_date: Optional[str] = None
     end_date: Optional[str] = None
     scenario_type: Optional[str] = None
+    effectivization_date: Optional[str] = None
