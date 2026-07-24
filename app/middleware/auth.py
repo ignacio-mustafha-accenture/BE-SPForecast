@@ -6,6 +6,9 @@ from app.errors import AppError
 
 SKIP_AUTH = {
     "/health",
+    "/docs",
+    "/redoc",
+    "/openapi.json",
     "/api/auth/login",
     "/api/auth/forgot-password",
     "/api/auth/reset-password",
