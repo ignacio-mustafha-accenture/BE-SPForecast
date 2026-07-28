@@ -61,7 +61,12 @@ async def get_state(window_offset: int = 0) -> dict:
                 ORDER BY p.start_date
             """)
             today = date.today()
-            rows_list = list(period_rows)
+            # Deduplicate by start_date, preferring Spanish month names ("Ago" < "Aug")
+            seen_starts: dict = {}
+            for r in sorted(period_rows, key=lambda r: (r["start_date"], r["period_name"])):
+                if r["start_date"] not in seen_starts:
+                    seen_starts[r["start_date"]] = r
+            rows_list = sorted(seen_starts.values(), key=lambda r: r["start_date"])
             cur = next(
                 (i for i, r in enumerate(rows_list)
                  if r["start_date"] <= today <= r["end_date"]),
@@ -132,7 +137,7 @@ async def get_state(window_offset: int = 0) -> dict:
         # --- Forecast map ---
         fp_rows = await conn.fetch(
             """SELECT eid, period_name, chg, sah,
-                      chg_effective, chg_assumption, ppa_adj, sl_real, sl_assumed, hl
+                      chg_hl, chg_sl, chg_cascadeadas, absence_hours, chg_pct_sl, chg_pct_hl
                FROM forecast_periods WHERE period_name = ANY($1)""",
             period_names,
         )
@@ -141,50 +146,46 @@ async def get_state(window_offset: int = 0) -> dict:
             if fp["eid"] not in forecast_map:
                 forecast_map[fp["eid"]] = {}
             forecast_map[fp["eid"]][fp["period_name"]] = {
-                "chg":            float(fp["chg"] or 0),
-                "sah":            float(fp["sah"] or 0),
-                "chg_effective":  float(fp["chg_effective"] or 0),
-                "chg_assumption": float(fp["chg_assumption"] or 0),
-                "ppa_adj":        float(fp["ppa_adj"] or 0),
-                "sl_real":        float(fp["sl_real"] or 0),
-                "sl_assumed":     float(fp["sl_assumed"] or 0),
-                "hl":             float(fp["hl"] or 0),
+                "chg":             float(fp["chg"] or 0),
+                "sah":             float(fp["sah"] or 0),
+                "chg_hl":          float(fp["chg_hl"] or 0),
+                "chg_sl":          float(fp["chg_sl"] or 0),
+                "chg_cascadeadas": float(fp["chg_cascadeadas"] or 0),
+                "absence_hours":   float(fp["absence_hours"] or 0),
+                "chg_pct_sl":      float(fp["chg_pct_sl"] or 0),
+                "chg_pct_hl":      float(fp["chg_pct_hl"] or 0),
             }
 
         employees = []
         for e in emp_rows:
             row = dict(e)
             fp = forecast_map.get(row["EID"], {})
-            chg_arr            = [float(fp.get(pn, {}).get("chg", 0))            for pn in period_names]
-            sah_arr            = [float(fp.get(pn, {}).get("sah", 0))            for pn in period_names]
-            chg_effective_arr  = [float(fp.get(pn, {}).get("chg_effective", 0))  for pn in period_names]
-            chg_assumption_arr = [float(fp.get(pn, {}).get("chg_assumption", 0)) for pn in period_names]
-            ppa_adj_arr        = [float(fp.get(pn, {}).get("ppa_adj", 0))        for pn in period_names]
-            sl_real_arr        = [float(fp.get(pn, {}).get("sl_real", 0))        for pn in period_names]
-            sl_assumed_arr     = [float(fp.get(pn, {}).get("sl_assumed", 0))     for pn in period_names]
-            hl_arr             = [float(fp.get(pn, {}).get("hl", 0))             for pn in period_names]
-            cp_arr = [
-                round(chg_arr[i] / sah_arr[i] * 100) if sah_arr[i] > 0 else 0
-                for i in range(len(period_names))
-            ]
+            chg_arr              = [float(fp.get(pn, {}).get("chg", 0))             for pn in period_names]
+            sah_arr              = [float(fp.get(pn, {}).get("sah", 0))             for pn in period_names]
+            chg_hl_arr           = [float(fp.get(pn, {}).get("chg_hl", 0))          for pn in period_names]
+            chg_sl_arr           = [float(fp.get(pn, {}).get("chg_sl", 0))          for pn in period_names]
+            chg_cascadeadas_arr  = [float(fp.get(pn, {}).get("chg_cascadeadas", 0)) for pn in period_names]
+            absence_hours_arr    = [float(fp.get(pn, {}).get("absence_hours", 0))   for pn in period_names]
+            chg_pct_sl_arr       = [float(fp.get(pn, {}).get("chg_pct_sl", 0))      for pn in period_names]
+            chg_pct_hl_arr       = [float(fp.get(pn, {}).get("chg_pct_hl", 0))      for pn in period_names]
             # Effective if employee has any confirmed hours in current period;
             # assumption only when 100% of CHG comes from assumption blocks
             cur_fp = fp.get(period_names[0], {}) if period_names else {}
             is_assumption = (
-                float(cur_fp.get("chg_assumption", 0)) > 0
-                and float(cur_fp.get("chg_effective", 0)) == 0
+                float(cur_fp.get("chg_sl", 0)) > 0
+                and float(cur_fp.get("chg_hl", 0)) == 0
             )
             row.update({
-                "ScenarioType": "assumption" if is_assumption else "effective",
-                "chg":            chg_arr,
-                "sah":            sah_arr,
-                "cp":             cp_arr,
-                "chg_effective":  chg_effective_arr,
-                "chg_assumption": chg_assumption_arr,
-                "ppaAdj":         ppa_adj_arr,
-                "sickDays":       sl_real_arr,
-                "sl_assumed":     sl_assumed_arr,
-                "hl":             hl_arr,
+                "ScenarioType":    "assumption" if is_assumption else "effective",
+                "chg":             chg_arr,
+                "sah":             sah_arr,
+                "cp":              chg_pct_hl_arr,
+                "chg_hl":          chg_hl_arr,
+                "chg_sl":          chg_sl_arr,
+                "chg_cascadeadas": chg_cascadeadas_arr,
+                "absence_hours":   absence_hours_arr,
+                "chg_pct_sl":      chg_pct_sl_arr,
+                "chg_pct_hl":      chg_pct_hl_arr,
                 "NJFormat": (
                     f"{row['Name']} | {row['HireDate']} | CL{row['CL']} | {row['Country']}"
                     if row.get("NewJoiner") else None

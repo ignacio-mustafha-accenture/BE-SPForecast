@@ -8,11 +8,11 @@ from app.errors import AppError, ForecastException
 from app.models.tickets import TicketCreate, TicketUpdate, VALID_TICKET_TYPES
 
 REQUIRED_FIELDS: dict = {
-    "newproj": ["eid", "client_name", "offering_type", "chargeability_pct", "end_date"],
+    "newproj": ["eid", "client_name", "offering_type", "chargeability_pct", "start_date", "end_date"],
     "ongoing": ["eid", "end_date"],
     "pto":     ["eid", "start_date", "end_date"],
     "sick":    ["eid", "start_date", "end_date"],
-    "nj":      ["nj_name", "cl", "location", "people_lead", "start_date"],
+    "nj":      ["nj_name", "cl", "location", "people_lead", "start_date", "te_approver"],
     "baja":    ["eid", "end_date"],
 }
 
@@ -163,7 +163,7 @@ async def create(body: TicketCreate, created_by: str, request_id: str) -> dict:
         if not getattr(body, field, None):
             raise ForecastException(AppError.TICKET_MISSING_FIELDS)
 
-    if body.scenario_type == "assumption" and not body.effectivization_date:
+    if body.type in ("newproj", "ongoing") and body.scenario_type == "assumption" and not body.effectivization_date:
         raise ForecastException(AppError.VALIDATION_ERROR, "effectivization_date is required for assumption tickets")
 
     effective_end_date = body.end_date or body.new_end_date or body.start_date
@@ -187,6 +187,17 @@ async def create(body: TicketCreate, created_by: str, request_id: str) -> dict:
         async with db.pool.acquire() as conn:
             async with conn.transaction():
                 try:
+                    if body.type == "newproj" and body.eid and body.client_name:
+                        existing = await conn.fetchrow(
+                            "SELECT id FROM tickets WHERE type='newproj' AND eid=$1 AND client_name=$2 AND status='Approved' LIMIT 1",
+                            body.eid, body.client_name,
+                        )
+                        if existing:
+                            raise ForecastException(
+                                AppError.VALIDATION_ERROR,
+                                "Ya existe una asignación activa para este empleado y cliente. Usá un ticket 'En Curso'.",
+                            )
+
                     if body.eid and body.type not in ("nj",):
                         emp = await conn.fetchrow("SELECT eid FROM employees WHERE eid=$1", body.eid)
                         if not emp:
@@ -246,67 +257,89 @@ async def _apply_side_effects(conn, body: TicketCreate, effective_end_date, crea
         if not exists:
             await conn.execute(
                 """
-                INSERT INTO employees (eid, name, location, cl, hire_date, new_joiner, active, people_lead)
-                VALUES ($1,$2,$3,$4,$5::text::date,TRUE,TRUE,$6)
+                INSERT INTO employees (eid, name, country, location, cl, hire_date, new_joiner, active, people_lead)
+                VALUES ($1,$2,$3,$3,$4,$5::text::date,TRUE,TRUE,$6)
                 """,
                 nj_eid, body.nj_name, body.location or None,
                 body.cl, body.start_date or None, body.people_lead or None,
             )
+        if body.te_approver:
+            await conn.execute(
+                """
+                INSERT INTO forecast_update (eid, te_approver, updated_at)
+                VALUES ($1, $2, NOW())
+                ON CONFLICT (eid) DO UPDATE SET te_approver=EXCLUDED.te_approver, updated_at=NOW()
+                """,
+                nj_eid, body.te_approver,
+            )
 
 
 async def _apply_approval_side_effects(conn, ticket: dict, request_id: str):
+    from datetime import date as _d, timedelta as _td
+
     t_type = ticket.get("type")
     eid = ticket.get("eid")
     if not eid:
         return
 
     if t_type in ("sick", "pto"):
-        from datetime import date as _d
         start_date = ticket.get("start_date")
-        end_date = ticket.get("end_date") or start_date
+        end_date   = ticket.get("end_date") or start_date
         if not start_date:
             return
         if isinstance(start_date, str):
             start_date = _d.fromisoformat(start_date)
         if isinstance(end_date, str):
             end_date = _d.fromisoformat(end_date)
-        emp = await conn.fetchrow("SELECT COALESCE(country, location) AS country FROM employees WHERE eid=$1", eid)
+
+        emp = await conn.fetchrow(
+            "SELECT COALESCE(country, location) AS country FROM employees WHERE eid=$1", eid
+        )
         country = emp["country"] if emp else None
+
+        absence_type = "SICK" if t_type == "sick" else "PTO"
+
         if country:
-            cal_row = await conn.fetchrow(
+            working_days = await conn.fetch(
                 """
-                SELECT COALESCE(SUM(CASE WHEN is_working_day THEN 8 ELSE 0 END), 0) AS hrs,
-                       COUNT(*) AS days
-                FROM calendar
-                WHERE country=$1 AND date BETWEEN $2 AND $3
+                SELECT date FROM calendar
+                WHERE country=$1 AND date BETWEEN $2 AND $3 AND is_working_day=TRUE
+                ORDER BY date
                 """,
                 country, start_date, end_date,
             )
-            hours = int(cal_row["hrs"]) if cal_row and int(cal_row["hrs"]) > 0 else (end_date - start_date).days * 8 + 8
-            days = int(cal_row["days"]) if cal_row and int(cal_row["days"]) > 0 else (end_date - start_date).days + 1
+            for row in working_days:
+                await conn.execute(
+                    "INSERT INTO absences (eid, date, type) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING",
+                    eid, row["date"], absence_type,
+                )
+            days_count = len(working_days)
         else:
-            days = (end_date - start_date).days + 1
-            hours = days * 8
-        period_name = await _get_period_for_date(conn, start_date)
-        absence_type = "SICK" if t_type == "sick" else "PTO"
-        await conn.execute(
-            "INSERT INTO absences (eid, period_name, type, start_date, end_date, days, hours) VALUES ($1,$2,$3,$4,$5,$6,$7)",
-            eid, period_name, absence_type, start_date, end_date, days, hours,
-        )
+            cur = start_date
+            days_count = 0
+            while cur <= end_date:
+                await conn.execute(
+                    "INSERT INTO absences (eid, date, type) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING",
+                    eid, cur, absence_type,
+                )
+                cur += _td(days=1)
+                days_count += 1
+
         logger.bind(request_id=request_id).info(
-            "Absence inserted on ticket approval", eid=eid, type=absence_type, hours=hours
+            "Absences inserted on ticket approval",
+            eid=eid, type=absence_type, days=days_count,
         )
 
     elif t_type == "newproj":
         await conn.execute(
             """
             INSERT INTO forecast_update (eid, client, offering, roll_on, roll_off, chargeability_pct, updated_at)
-            VALUES ($1,$2,$3,$4::date,$5::date,$6,NOW())
+            VALUES ($1,$2,$3,$4::text::date,$5::text::date,$6,NOW())
             ON CONFLICT (eid) DO UPDATE SET
                 client=COALESCE($2,forecast_update.client),
                 offering=COALESCE($3,forecast_update.offering),
-                roll_on=COALESCE($4::date,forecast_update.roll_on),
-                roll_off=COALESCE($5::date,forecast_update.roll_off),
+                roll_on=COALESCE($4::text::date,forecast_update.roll_on),
+                roll_off=COALESCE($5::text::date,forecast_update.roll_off),
                 chargeability_pct=COALESCE($6,forecast_update.chargeability_pct),
                 updated_at=NOW()
             """,
@@ -321,7 +354,7 @@ async def _apply_approval_side_effects(conn, ticket: dict, request_id: str):
         await conn.execute(
             """
             UPDATE forecast_update SET
-                roll_off=COALESCE($2::date, roll_off),
+                roll_off=COALESCE($2::text::date, roll_off),
                 chargeability_pct=COALESCE($3, chargeability_pct),
                 updated_at=NOW()
             WHERE eid=$1
@@ -334,7 +367,7 @@ async def _apply_approval_side_effects(conn, ticket: dict, request_id: str):
         end_date = ticket.get("end_date")
         if end_date:
             await conn.execute(
-                "UPDATE employees SET termination_date=$2::date WHERE eid=$1", eid, end_date
+                "UPDATE employees SET termination_date=$2::text::date, active=FALSE WHERE eid=$1", eid, end_date
             )
         logger.bind(request_id=request_id).info("baja applied to employees", eid=eid)
 

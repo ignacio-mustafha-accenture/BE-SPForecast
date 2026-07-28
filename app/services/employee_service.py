@@ -17,8 +17,9 @@ async def list_employees(
     params: list = []
 
     if country:
-        params.append(country)
-        conditions.append(f"LOWER(COALESCE(e.country, e.location)) = LOWER(${len(params)})")
+        countries = [c.strip().lower() for c in country.split(',') if c.strip()]
+        params.append(countries)
+        conditions.append(f"LOWER(COALESCE(e.country, e.location)) = ANY(${len(params)})")
 
     if q:
         params.append(f"%{q}%")
@@ -95,8 +96,8 @@ async def list_employees(
         fp_map: dict = {}
         if eids and current_period:
             fp_rows = await conn.fetch(
-                """SELECT eid, chg, sah, chg_effective, chg_assumption, ppa_adj,
-                          sl_real, sl_assumed, hl
+                """SELECT eid, chg, sah, chg_hl, chg_sl, chg_cascadeadas,
+                          absence_hours, chg_pct_sl, chg_pct_hl
                    FROM forecast_periods WHERE eid = ANY($1) AND period_name = $2""",
                 eids, current_period,
             )
@@ -107,25 +108,24 @@ async def list_employees(
         row = dict(r)
         row.pop("_total", None)
         fp = fp_map.get(row["EID"])
-        chg_val            = float(fp["chg"] or 0)            if fp else 0.0
-        sah_val            = float(fp["sah"] or 0)            if fp else 0.0
-        chg_effective_val  = float(fp["chg_effective"] or 0)  if fp else 0.0
-        chg_assumption_val = float(fp["chg_assumption"] or 0) if fp else 0.0
-        ppa_adj_val        = float(fp["ppa_adj"] or 0)        if fp else 0.0
-        sl_real_val        = float(fp["sl_real"] or 0)        if fp else 0.0
-        sl_assumed_val     = float(fp["sl_assumed"] or 0)     if fp else 0.0
-        hl_val             = float(fp["hl"] or 0)             if fp else 0.0
-        cp_val = round(chg_val / sah_val * 100) if sah_val > 0 else 0
+        chg_val              = float(fp["chg"] or 0)             if fp else 0.0
+        sah_val              = float(fp["sah"] or 0)             if fp else 0.0
+        chg_hl_val           = float(fp["chg_hl"] or 0)          if fp else 0.0
+        chg_sl_val           = float(fp["chg_sl"] or 0)          if fp else 0.0
+        chg_cascadeadas_val  = float(fp["chg_cascadeadas"] or 0) if fp else 0.0
+        absence_hours_val    = float(fp["absence_hours"] or 0)   if fp else 0.0
+        chg_pct_sl_val       = float(fp["chg_pct_sl"] or 0)      if fp else 0.0
+        chg_pct_hl_val       = float(fp["chg_pct_hl"] or 0)      if fp else 0.0
         row.update({
-            "chg":            [chg_val],
-            "sah":            [sah_val],
-            "cp":             [cp_val],
-            "chg_effective":  [chg_effective_val],
-            "chg_assumption": [chg_assumption_val],
-            "ppaAdj":         [ppa_adj_val],
-            "sickDays":       [sl_real_val],
-            "sl_assumed":     [sl_assumed_val],
-            "hl":             [hl_val],
+            "chg":             [chg_val],
+            "sah":             [sah_val],
+            "cp":              [chg_pct_hl_val],
+            "chg_hl":          [chg_hl_val],
+            "chg_sl":          [chg_sl_val],
+            "chg_cascadeadas": [chg_cascadeadas_val],
+            "absence_hours":   [absence_hours_val],
+            "chg_pct_sl":      [chg_pct_sl_val],
+            "chg_pct_hl":      [chg_pct_hl_val],
             "NJFormat": (
                 f"{row['Name']} | {row['HireDate']} | CL{row['CL']} | {row['Country']}"
                 if row.get("NewJoiner") else None
@@ -276,8 +276,8 @@ async def get_employee(eid: str) -> dict:
         fp_map: dict = {}
         if current_period:
             fp_rows = await conn.fetch(
-                """SELECT eid, chg, sah, chg_effective, chg_assumption, ppa_adj,
-                          sl_real, sl_assumed, hl
+                """SELECT eid, chg, sah, chg_hl, chg_sl, chg_cascadeadas,
+                          absence_hours, chg_pct_sl, chg_pct_hl
                    FROM forecast_periods WHERE eid = $1 AND period_name = $2""",
                 eid, current_period,
             )
@@ -285,25 +285,24 @@ async def get_employee(eid: str) -> dict:
 
     result = dict(row)
     fp = fp_map.get(eid)
-    chg_val            = float(fp["chg"] or 0)            if fp else 0.0
-    sah_val            = float(fp["sah"] or 0)            if fp else 0.0
-    chg_effective_val  = float(fp["chg_effective"] or 0)  if fp else 0.0
-    chg_assumption_val = float(fp["chg_assumption"] or 0) if fp else 0.0
-    ppa_adj_val        = float(fp["ppa_adj"] or 0)        if fp else 0.0
-    sl_real_val        = float(fp["sl_real"] or 0)        if fp else 0.0
-    sl_assumed_val     = float(fp["sl_assumed"] or 0)     if fp else 0.0
-    hl_val             = float(fp["hl"] or 0)             if fp else 0.0
-    cp_val = round(chg_val / sah_val * 100) if sah_val > 0 else 0
+    chg_val              = float(fp["chg"] or 0)             if fp else 0.0
+    sah_val              = float(fp["sah"] or 0)             if fp else 0.0
+    chg_hl_val           = float(fp["chg_hl"] or 0)          if fp else 0.0
+    chg_sl_val           = float(fp["chg_sl"] or 0)          if fp else 0.0
+    chg_cascadeadas_val  = float(fp["chg_cascadeadas"] or 0) if fp else 0.0
+    absence_hours_val    = float(fp["absence_hours"] or 0)   if fp else 0.0
+    chg_pct_sl_val       = float(fp["chg_pct_sl"] or 0)      if fp else 0.0
+    chg_pct_hl_val       = float(fp["chg_pct_hl"] or 0)      if fp else 0.0
     result.update({
-        "chg":            [chg_val],
-        "sah":            [sah_val],
-        "cp":             [cp_val],
-        "chg_effective":  [chg_effective_val],
-        "chg_assumption": [chg_assumption_val],
-        "ppaAdj":         [ppa_adj_val],
-        "sickDays":       [sl_real_val],
-        "sl_assumed":     [sl_assumed_val],
-        "hl":             [hl_val],
+        "chg":             [chg_val],
+        "sah":             [sah_val],
+        "cp":              [chg_pct_hl_val],
+        "chg_hl":          [chg_hl_val],
+        "chg_sl":          [chg_sl_val],
+        "chg_cascadeadas": [chg_cascadeadas_val],
+        "absence_hours":   [absence_hours_val],
+        "chg_pct_sl":      [chg_pct_sl_val],
+        "chg_pct_hl":      [chg_pct_hl_val],
         "NJFormat": (
             f"{result['Name']} | {result['HireDate']} | CL{result['CL']} | {result['Country']}"
             if result.get("NewJoiner") else None
