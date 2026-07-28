@@ -17,8 +17,9 @@ async def list_employees(
     params: list = []
 
     if country:
-        params.append(country)
-        conditions.append(f"LOWER(COALESCE(e.country, e.location)) = LOWER(${len(params)})")
+        countries = [c.strip().lower() for c in country.split(',') if c.strip()]
+        params.append(countries)
+        conditions.append(f"LOWER(COALESCE(e.country, e.location)) = ANY(${len(params)})")
 
     if q:
         params.append(f"%{q}%")

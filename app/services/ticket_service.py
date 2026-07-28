@@ -275,13 +275,14 @@ async def _apply_side_effects(conn, body: TicketCreate, effective_end_date, crea
 
 
 async def _apply_approval_side_effects(conn, ticket: dict, request_id: str):
+    from datetime import date as _d, timedelta as _td
+
     t_type = ticket.get("type")
     eid = ticket.get("eid")
     if not eid:
         return
 
     if t_type in ("sick", "pto"):
-        from datetime import date as _d, timedelta as _td
         start_date = ticket.get("start_date")
         end_date   = ticket.get("end_date") or start_date
         if not start_date:
@@ -333,12 +334,12 @@ async def _apply_approval_side_effects(conn, ticket: dict, request_id: str):
         await conn.execute(
             """
             INSERT INTO forecast_update (eid, client, offering, roll_on, roll_off, chargeability_pct, updated_at)
-            VALUES ($1,$2,$3,$4::date,$5::date,$6,NOW())
+            VALUES ($1,$2,$3,$4::text::date,$5::text::date,$6,NOW())
             ON CONFLICT (eid) DO UPDATE SET
                 client=COALESCE($2,forecast_update.client),
                 offering=COALESCE($3,forecast_update.offering),
-                roll_on=COALESCE($4::date,forecast_update.roll_on),
-                roll_off=COALESCE($5::date,forecast_update.roll_off),
+                roll_on=COALESCE($4::text::date,forecast_update.roll_on),
+                roll_off=COALESCE($5::text::date,forecast_update.roll_off),
                 chargeability_pct=COALESCE($6,forecast_update.chargeability_pct),
                 updated_at=NOW()
             """,
@@ -353,7 +354,7 @@ async def _apply_approval_side_effects(conn, ticket: dict, request_id: str):
         await conn.execute(
             """
             UPDATE forecast_update SET
-                roll_off=COALESCE($2::date, roll_off),
+                roll_off=COALESCE($2::text::date, roll_off),
                 chargeability_pct=COALESCE($3, chargeability_pct),
                 updated_at=NOW()
             WHERE eid=$1
@@ -366,7 +367,7 @@ async def _apply_approval_side_effects(conn, ticket: dict, request_id: str):
         end_date = ticket.get("end_date")
         if end_date:
             await conn.execute(
-                "UPDATE employees SET termination_date=$2::date, active=FALSE WHERE eid=$1", eid, end_date
+                "UPDATE employees SET termination_date=$2::text::date, active=FALSE WHERE eid=$1", eid, end_date
             )
         logger.bind(request_id=request_id).info("baja applied to employees", eid=eid)
 

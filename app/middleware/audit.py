@@ -11,6 +11,7 @@ TRACKED_ACTION_PREFIXES = (
     "Approve ticket #",
     "Reject ticket #",
     "Create PPA:",
+    "Effectivize employee:",
 )
 
 
