@@ -56,7 +56,7 @@ INSERT INTO employees (eid, name, country, location, cl, fte, new_joiner, active
   ('vargas.camila',      'Camila Vargas',    'Mexico',     'MX', 10, 1.0, FALSE, TRUE,  TRUE,  '2024-01-15'),
   ('gutierrez.jose',     'Jose Gutierrez',   'Costa Rica', 'CR',  9, 1.0, FALSE, TRUE,  TRUE,  '2024-01-15'),
   ('blanco.andrea',      'Andrea Blanco',    'Argentina',  'AR', 11, 1.0, FALSE, FALSE, TRUE,  '2023-03-01'),
-  ('torres.martin',      'Martin Torres',    'Argentina',  'AR',  8, 0.5, FALSE, TRUE,  TRUE,  '2024-01-15');
+  ('torres.martin',      'Martin Torres',    'Argentina',  'AR',  8, 1.0, FALSE, TRUE,  TRUE,  '2024-01-15');
 
 -- People lead: diaz.lucia → garcia.sofia; resto AR → garcia.sofia
 UPDATE employees SET people_lead = 'garcia.sofia' WHERE eid = 'diaz.lucia';
@@ -178,7 +178,7 @@ VALUES
   ('gutierrez.jose', 'Sep-P1', 100, 'effective', '2026-09-01', '2026-09-15', NULL,        'garcia.sofia'),
   ('gutierrez.jose', 'Sep-P2', 100, 'effective', '2026-09-16', '2026-09-30', NULL,        'garcia.sofia'),
   ('gutierrez.jose', 'Oct-P1', 100, 'effective', '2026-10-01', '2026-10-15', NULL,        'garcia.sofia'),
--- torres.martin — effective 100%, 6 períodos (FTE 0.5)
+-- torres.martin — effective 100%, 6 períodos
   ('torres.martin', 'Jul-P2', 100, 'effective', '2026-07-16', '2026-07-31', NULL,         'garcia.sofia'),
   ('torres.martin', 'Ago-P1', 100, 'effective', '2026-08-01', '2026-08-15', NULL,         'garcia.sofia'),
   ('torres.martin', 'Ago-P2', 100, 'effective', '2026-08-16', '2026-08-31', NULL,         'garcia.sofia'),
@@ -192,7 +192,7 @@ VALUES
 -- ============================================================
 -- SECCIÓN 6 — FORECAST_PERIODS (valores pre-computados)
 -- SAH base: P2=80h (10 días×8h), P1=88h (11 días×8h) - aproximación sin feriados
--- FTE 0.5 → SAH×0.5; sick/PTO ajustan sah y absence_hours
+-- sick/PTO ajustan sah y absence_hours
 -- chg = chg_hl + chg_sl; chg_cascadeadas = 0 en todo el seed
 -- ============================================================
 
@@ -289,13 +289,13 @@ VALUES
   ('gutierrez.jose', 'Sep-P1', 88, 88, 88, 0, 0, 0,  100, 100),
   ('gutierrez.jose', 'Sep-P2', 80, 80, 80, 0, 0, 0,  100, 100),
   ('gutierrez.jose', 'Oct-P1', 88, 88, 88, 0, 0, 0,  100, 100),
--- torres.martin — effective 100%, FTE 0.5 → SAH×0.5
-  ('torres.martin', 'Jul-P2', 40, 40, 40, 0, 0, 0,  100, 100),
-  ('torres.martin', 'Ago-P1', 44, 44, 44, 0, 0, 0,  100, 100),
-  ('torres.martin', 'Ago-P2', 40, 40, 40, 0, 0, 0,  100, 100),
-  ('torres.martin', 'Sep-P1', 44, 44, 44, 0, 0, 0,  100, 100),
-  ('torres.martin', 'Sep-P2', 40, 40, 40, 0, 0, 0,  100, 100),
-  ('torres.martin', 'Oct-P1', 44, 44, 44, 0, 0, 0,  100, 100);
+-- torres.martin — effective 100%
+  ('torres.martin', 'Jul-P2', 80, 80, 80, 0, 0, 0,  100, 100),
+  ('torres.martin', 'Ago-P1', 88, 88, 88, 0, 0, 0,  100, 100),
+  ('torres.martin', 'Ago-P2', 80, 80, 80, 0, 0, 0,  100, 100),
+  ('torres.martin', 'Sep-P1', 88, 88, 88, 0, 0, 0,  100, 100),
+  ('torres.martin', 'Sep-P2', 80, 80, 80, 0, 0, 0,  100, 100),
+  ('torres.martin', 'Oct-P1', 88, 88, 88, 0, 0, 0,  100, 100);
 
 
 -- ============================================================

@@ -19,6 +19,12 @@ async def list_employees(
     return await employee_service.list_employees(country, q, status, page, page_size)
 
 
+@router.get("/on-pto", dependencies=[require_permission("state:read")])
+async def employees_on_pto(request: Request):
+    request.state.action = "List employees on PTO"
+    return await employee_service.get_employees_on_pto()
+
+
 @router.get("/{eid}", dependencies=[require_permission("state:read")])
 async def get_employee(eid: str, request: Request):
     request.state.action = f"View employee: {eid}"

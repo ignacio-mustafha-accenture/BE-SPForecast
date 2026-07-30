@@ -240,6 +240,9 @@ async def create(body: TicketCreate, created_by: str, request_id: str) -> dict:
                 except asyncpg.UniqueViolationError:
                     logger.bind(request_id=request_id).warning("EID conflict", eid=body.eid)
                     raise ForecastException(AppError.EMPLOYEE_EID_TAKEN)
+                except asyncpg.ForeignKeyViolationError as e:
+                    logger.bind(request_id=request_id).warning("FK violation creating ticket", detail=str(e))
+                    raise ForecastException(AppError.VALIDATION_ERROR, "Un EID referenciado no existe. Verificá people_lead y te_approver.")
                 except Exception as e:
                     logger.bind(request_id=request_id).exception("Unexpected error creating ticket")
                     raise ForecastException(AppError.INTERNAL_ERROR, str(e))
@@ -255,15 +258,25 @@ async def _apply_side_effects(conn, body: TicketCreate, effective_end_date, crea
         nj_eid = body.eid_accenture or _normalize_nj_eid(body.nj_name)
         exists = await conn.fetchrow("SELECT eid FROM employees WHERE eid=$1", nj_eid)
         if not exists:
+            pl_eid = None
+            if body.people_lead:
+                pl_row = await conn.fetchrow("SELECT eid FROM employees WHERE eid=$1", body.people_lead)
+                pl_eid = body.people_lead if pl_row else None
             await conn.execute(
                 """
                 INSERT INTO employees (eid, name, country, location, cl, hire_date, new_joiner, active, people_lead)
                 VALUES ($1,$2,$3,$3,$4,$5::text::date,TRUE,TRUE,$6)
                 """,
                 nj_eid, body.nj_name, body.location or None,
-                body.cl, body.start_date or None, body.people_lead or None,
+                body.cl, body.start_date or None, pl_eid,
             )
         if body.te_approver:
+            te_row = await conn.fetchrow("SELECT eid FROM employees WHERE eid=$1", body.te_approver)
+            if not te_row:
+                raise ForecastException(
+                    AppError.VALIDATION_ERROR,
+                    f"TE Approver EID '{body.te_approver}' no existe. Ingresá un EID válido (ej. garcia.sofia).",
+                )
             await conn.execute(
                 """
                 INSERT INTO forecast_update (eid, te_approver, updated_at)
@@ -275,7 +288,7 @@ async def _apply_side_effects(conn, body: TicketCreate, effective_end_date, crea
 
 
 async def _apply_approval_side_effects(conn, ticket: dict, request_id: str):
-    from datetime import date as _d, timedelta as _td
+    from datetime import date as _d
 
     t_type = ticket.get("type")
     eid = ticket.get("eid")
@@ -300,35 +313,53 @@ async def _apply_approval_side_effects(conn, ticket: dict, request_id: str):
         absence_type = "SICK" if t_type == "sick" else "PTO"
 
         if country:
-            working_days = await conn.fetch(
+            days_count = await conn.fetchval(
                 """
-                SELECT date FROM calendar
+                SELECT COUNT(*) FROM calendar
                 WHERE country=$1 AND date BETWEEN $2 AND $3 AND is_working_day=TRUE
-                ORDER BY date
                 """,
                 country, start_date, end_date,
             )
-            for row in working_days:
-                await conn.execute(
-                    "INSERT INTO absences (eid, date, type) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING",
-                    eid, row["date"], absence_type,
-                )
-            days_count = len(working_days)
         else:
-            cur = start_date
-            days_count = 0
-            while cur <= end_date:
-                await conn.execute(
-                    "INSERT INTO absences (eid, date, type) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING",
-                    eid, cur, absence_type,
-                )
-                cur += _td(days=1)
-                days_count += 1
+            days_count = (end_date - start_date).days + 1
+
+        await conn.execute(
+            "DELETE FROM absences WHERE eid=$1 AND start_date=$2 AND end_date=$3 AND type=$4",
+            eid, start_date, end_date, absence_type,
+        )
+        await conn.execute(
+            "INSERT INTO absences (eid, type, start_date, end_date, hours) VALUES ($1,$2,$3,$4,$5)",
+            eid, absence_type, start_date, end_date, days_count * 8,
+        )
 
         logger.bind(request_id=request_id).info(
-            "Absences inserted on ticket approval",
-            eid=eid, type=absence_type, days=days_count,
+            "Absence inserted on ticket approval",
+            eid=eid, type=absence_type, start=str(start_date), end=str(end_date), hours=days_count * 8,
         )
+
+        if absence_type == "PTO":
+            today = _d.today()
+            next_abs = await conn.fetchrow(
+                """
+                SELECT start_date, end_date, hours FROM absences
+                WHERE eid=$1 AND type='PTO' AND end_date >= $2
+                ORDER BY start_date ASC
+                LIMIT 1
+                """,
+                eid, today,
+            )
+            if next_abs:
+                await conn.execute(
+                    """
+                    UPDATE forecast_update
+                    SET next_pto=$2, next_pto_end=$3, next_pto_hours=$4, updated_at=NOW()
+                    WHERE eid=$1
+                    """,
+                    eid,
+                    next_abs["start_date"],
+                    next_abs["end_date"],
+                    next_abs["hours"] or 0,
+                )
 
     elif t_type == "newproj":
         await conn.execute(
@@ -385,7 +416,7 @@ async def _recalculate_all_periods_for_eid(conn, eid: str, request_id: str):
         try:
             await conn.execute("SELECT recalculate_forecast_period($1,$2)", eid, p["period_name"])
         except Exception as e:
-            logger.bind(request_id=request_id).warning("Period recalculate failed", period=p["period_name"], error=str(e))
+            logger.bind(request_id=request_id).warning(f"Period recalculate failed | period={p['period_name']} | error={e}")
 
 
 async def update(ticket_id: int, body: TicketUpdate, request_id: str) -> dict:

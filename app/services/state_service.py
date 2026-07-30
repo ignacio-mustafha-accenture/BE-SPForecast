@@ -92,6 +92,12 @@ async def get_state(window_offset: int = 0) -> dict:
 
         period_names = [p["period_name"] for p in periods]
 
+        # --- Active PTOs (today ∈ [start_date, end_date]) ---
+        pto_rows = await conn.fetch(
+            "SELECT eid FROM absences WHERE type='PTO' AND start_date <= CURRENT_DATE AND end_date >= CURRENT_DATE"
+        )
+        active_pto_eids = {r["eid"] for r in pto_rows}
+
         # --- Employees ---
         emp_rows = await conn.fetch("""
             WITH latest_fu AS (
@@ -195,6 +201,7 @@ async def get_state(window_offset: int = 0) -> dict:
                 "DaysToAvailable": float(row.get("DaysToAvailable") or 0),
                 "NextPTOHours": float(row.get("NextPTOHours") or 0),
                 "Charge": row.get("Charge") is not False,
+                "IsOnPTO": row["EID"] in active_pto_eids,
             })
             employees.append(row)
 
