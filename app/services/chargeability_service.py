@@ -132,17 +132,92 @@ async def effectivize_employee(eid: str, period_names: list[str] | None, chargea
 
         updated = len(rows)
         affected = {r["period_name"] for r in rows if r["period_name"]}
+        logger.info("Effectivize blocks updated", eid=eid, updated=updated, affected=list(affected))
 
-        # Recalculate outside the transaction — same pattern as recalculate_service.py
-        for pname in affected:
+        # Always recalculate ALL requested periods, not just the ones that changed.
+        # forecast_periods can be stale from a previous run where the stored proc failed.
+        # If a period was already effective (updated=0 for it), we still need to sync fp.
+        if period_names:
+            periods_to_recalc = set(period_names)
+        else:
+            # "all" mode — recalculate every period that has a block for this employee
+            block_period_rows = await conn.fetch(
+                "SELECT DISTINCT period_name FROM chargeability_blocks WHERE eid = $1 AND period_name IS NOT NULL",
+                eid,
+            )
+            periods_to_recalc = {r["period_name"] for r in block_period_rows}
+
+        fp_updated = 0
+        for pname in periods_to_recalc:
+            # Snapshot chg_pct_sl BEFORE any modifications so we can detect the
+            # "no blocks but FP has SL" case after the stored proc may zero it out.
+            orig = await conn.fetchrow(
+                "SELECT chg_pct_sl FROM forecast_periods WHERE eid=$1 AND period_name=$2",
+                eid, pname,
+            )
+            orig_sl = float(orig["chg_pct_sl"] or 0) if orig else 0.0
+
+            # 1) Try the stored proc (handles PPAs, absences, cascadeadas).
             try:
                 await conn.execute(
                     "SELECT recalculate_forecast_period($1,$2)", eid, pname
                 )
             except Exception as e:
-                logger.warning("Recalculate failed after effectivize", error=str(e))
+                logger.warning("Recalculate stored proc failed", eid=eid, period=pname, error=str(e))
 
-    return {"ok": True, "updated": updated}
+            if pname in affected:
+                # 2a) Assumption blocks were moved to effective → rebuild chg_pct from blocks.
+                fp_row = await conn.fetchrow(
+                    """
+                    WITH totals AS (
+                        SELECT
+                            COALESCE(SUM(chargeability_pct) FILTER (WHERE scenario_type = 'effective'),  0) AS hl_pct,
+                            COALESCE(SUM(chargeability_pct) FILTER (WHERE scenario_type = 'assumption'), 0) AS sl_pct
+                        FROM chargeability_blocks
+                        WHERE eid = $1 AND period_name = $2
+                    )
+                    UPDATE forecast_periods fp
+                    SET chg_pct_hl = t.hl_pct,
+                        chg_pct_sl = t.sl_pct,
+                        chg_hl     = ROUND(fp.sah * t.hl_pct / 100.0),
+                        chg_sl     = ROUND(fp.sah * t.sl_pct / 100.0),
+                        chg        = ROUND(fp.sah * (t.hl_pct + t.sl_pct) / 100.0)
+                    FROM totals t
+                    WHERE fp.eid = $1 AND fp.period_name = $2
+                    RETURNING fp.chg_pct_hl, fp.chg_pct_sl
+                    """,
+                    eid, pname,
+                )
+            elif orig_sl > 0:
+                # 2b) No assumption blocks for this period, but forecast_periods had SL.
+                # Move SL → HL directly using the requested chargeability_pct.
+                fp_row = await conn.fetchrow(
+                    """
+                    UPDATE forecast_periods fp
+                    SET chg_pct_hl = $3,
+                        chg_hl     = ROUND(fp.sah * $3 / 100.0),
+                        chg        = ROUND(fp.sah * $3 / 100.0),
+                        chg_pct_sl = 0,
+                        chg_sl     = 0
+                    WHERE fp.eid = $1 AND fp.period_name = $2
+                    RETURNING fp.chg_pct_hl, fp.chg_pct_sl
+                    """,
+                    eid, pname, chargeability_pct,
+                )
+                logger.info("SL→HL fallback (no blocks)", eid=eid, period=pname,
+                            orig_sl=orig_sl, hl=chargeability_pct)
+            else:
+                fp_row = None
+
+            if fp_row:
+                fp_updated += 1
+                logger.info("forecast_periods updated", eid=eid, period=pname,
+                            chg_pct_hl=float(fp_row["chg_pct_hl"]), chg_pct_sl=float(fp_row["chg_pct_sl"]))
+            else:
+                logger.info("forecast_periods skipped (no change needed)", eid=eid, period=pname)
+
+    logger.info("Effectivize complete", eid=eid, updated=updated, fp_updated=fp_updated)
+    return {"ok": True, "updated": updated + fp_updated}
 
 
 async def delete_block(block_id: int, eid: str) -> None:

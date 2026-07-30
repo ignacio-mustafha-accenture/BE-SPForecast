@@ -16,7 +16,34 @@ async def recalculate_employee(eid: str, request_id: str = "-") -> dict:
         )
         start = time.monotonic()
         for p in periods:
-            await conn.execute("SELECT recalculate_forecast_period($1,$2)", eid, p["period_name"])
+            pname = p["period_name"]
+            try:
+                await conn.execute("SELECT recalculate_forecast_period($1,$2)", eid, pname)
+            except Exception as e:
+                logger.warning("Stored proc failed during recalculate", eid=eid, period=pname, error=str(e))
+
+            # Direct UPDATE from chargeability_blocks as fallback/override.
+            # Ensures chg_pct_hl and chg_pct_sl always match actual block state.
+            await conn.execute(
+                """
+                WITH totals AS (
+                    SELECT
+                        COALESCE(SUM(chargeability_pct) FILTER (WHERE scenario_type = 'effective'),  0) AS hl_pct,
+                        COALESCE(SUM(chargeability_pct) FILTER (WHERE scenario_type = 'assumption'), 0) AS sl_pct
+                    FROM chargeability_blocks
+                    WHERE eid = $1 AND period_name = $2
+                )
+                UPDATE forecast_periods fp
+                SET chg_pct_hl = t.hl_pct,
+                    chg_pct_sl = t.sl_pct,
+                    chg_hl     = ROUND(fp.sah * t.hl_pct / 100.0),
+                    chg_sl     = ROUND(fp.sah * t.sl_pct / 100.0),
+                    chg        = ROUND(fp.sah * (t.hl_pct + t.sl_pct) / 100.0)
+                FROM totals t
+                WHERE fp.eid = $1 AND fp.period_name = $2
+                """,
+                eid, pname,
+            )
 
         duration = int((time.monotonic() - start) * 1000)
         logger.bind(request_id=request_id, duration_ms=duration).info(

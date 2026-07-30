@@ -94,6 +94,8 @@ async def list_employees(
 
         eids = [r["EID"] for r in rows]
         fp_map: dict = {}
+        scenario_map: dict = {}
+        assumption_eids: set = set()
         if eids and current_period:
             fp_rows = await conn.fetch(
                 """SELECT eid, chg, sah, chg_hl, chg_sl, chg_cascadeadas,
@@ -102,6 +104,27 @@ async def list_employees(
                 eids, current_period,
             )
             fp_map = {r["eid"]: r for r in fp_rows}
+
+            # ScenarioType: current period's block — drives Gantt bar style (solid vs dashed).
+            block_rows = await conn.fetch(
+                """SELECT DISTINCT ON (eid) eid, scenario_type
+                   FROM chargeability_blocks
+                   WHERE eid = ANY($1) AND period_name = $2
+                   ORDER BY eid, (scenario_type = 'assumption') DESC""",
+                eids, current_period,
+            )
+            scenario_map = {r["eid"]: r["scenario_type"] for r in block_rows}
+
+            # HasAssumptionBlocks: any assumption block in current or future periods.
+            assumption_rows = await conn.fetch(
+                """SELECT DISTINCT cb.eid
+                   FROM chargeability_blocks cb
+                   JOIN periods p ON cb.period_name = p.period_name
+                   WHERE cb.eid = ANY($1) AND cb.scenario_type = 'assumption'
+                     AND p.end_date >= CURRENT_DATE""",
+                eids,
+            )
+            assumption_eids = {r["eid"] for r in assumption_rows}
 
     employees = []
     for r in rows:
@@ -126,6 +149,8 @@ async def list_employees(
             "absence_hours":   [absence_hours_val],
             "chg_pct_sl":      [chg_pct_sl_val],
             "chg_pct_hl":      [chg_pct_hl_val],
+            "ScenarioType":        scenario_map.get(row["EID"], "effective"),
+            "HasAssumptionBlocks": row["EID"] in assumption_eids,
             "NJFormat": (
                 f"{row['Name']} | {row['HireDate']} | CL{row['CL']} | {row['Country']}"
                 if row.get("NewJoiner") else None
@@ -140,6 +165,26 @@ async def list_employees(
 
     pages = -(-total // page_size) if page_size > 0 else 0
     return {"items": employees, "total": total, "page": page, "page_size": page_size, "pages": pages}
+
+
+async def get_employees_on_pto() -> list:
+    async with db.pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT
+                e.eid AS "EID",
+                e.name AS "Name",
+                COALESCE(e.country, e.location) AS "Country",
+                a.start_date::text AS "PTOStart",
+                a.end_date::text AS "PTOEnd",
+                a.hours AS "PTOHours"
+            FROM absences a
+            JOIN employees e ON a.eid = e.eid
+            WHERE a.type = 'PTO'
+              AND a.start_date <= CURRENT_DATE
+              AND a.end_date >= CURRENT_DATE
+            ORDER BY e.name
+        """)
+        return [dict(r) for r in rows]
 
 
 async def update(eid: str, body: EmployeeUpdate, request_id: str) -> dict:
