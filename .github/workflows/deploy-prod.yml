@@ -1,0 +1,41 @@
+name: Deploy → Prod
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  BACKEND_IMAGE: forecastregistry.azurecr.io/forecast-backend
+
+jobs:
+  deploy-backend:
+    name: Build & Deploy to Prod
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Login to ACR
+        run: az acr login --name forecastregistry
+
+      - name: Build & push image
+        run: |
+          TAG="${{ env.BACKEND_IMAGE }}:${{ github.sha }}"
+          docker build -t "$TAG" .
+          docker push "$TAG"
+          docker tag "$TAG" "${{ env.BACKEND_IMAGE }}:prod-latest"
+          docker push "${{ env.BACKEND_IMAGE }}:prod-latest"
+
+      - name: Update Container App revision
+        run: |
+          az containerapp update \
+            --name forecast-backend-prod \
+            --resource-group rg-forecast-prod \
+            --image "${{ env.BACKEND_IMAGE }}:${{ github.sha }}"
