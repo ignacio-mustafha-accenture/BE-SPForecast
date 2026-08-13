@@ -216,6 +216,31 @@ async def effectivize_employee(eid: str, period_names: list[str] | None, chargea
             else:
                 logger.info("forecast_periods skipped (no change needed)", eid=eid, period=pname)
 
+        # Refresh assumption projection blocks for periods post roll-off
+        fu = await conn.fetchrow(
+            "SELECT roll_off, client FROM forecast_update WHERE eid=$1 ORDER BY updated_at DESC NULLS LAST LIMIT 1",
+            eid,
+        )
+        if fu and fu["roll_off"]:
+            from app.services.assumption_service import get_assumption_num, upsert_projection_blocks
+            num = await get_assumption_num(conn, client_name=fu["client"], is_nj=False, eid=eid)
+            await upsert_projection_blocks(
+                conn, eid,
+                ref_date=fu["roll_off"],
+                num=num,
+                effectivization_date=None,
+                request_id="-",
+            )
+            proj_periods = await conn.fetch(
+                "SELECT period_name FROM periods WHERE end_date > $1 ORDER BY start_date LIMIT 6",
+                fu["roll_off"],
+            )
+            for p in proj_periods:
+                try:
+                    await conn.execute("SELECT recalculate_forecast_period($1,$2)", eid, p["period_name"])
+                except Exception as e:
+                    logger.warning("Recalc failed for projection period", eid=eid, period=p["period_name"], error=str(e))
+
     logger.info("Effectivize complete", eid=eid, updated=updated, fp_updated=fp_updated)
     return {"ok": True, "updated": updated + fp_updated}
 

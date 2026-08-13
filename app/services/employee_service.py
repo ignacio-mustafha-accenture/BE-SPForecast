@@ -4,6 +4,7 @@ import app.db as db
 from app.config import settings
 from app.errors import AppError, ForecastException
 from app.models.employees import EmployeeUpdate
+import app.services.recalculate_service as recalculate_service
 
 
 async def list_employees(
@@ -12,6 +13,9 @@ async def list_employees(
     status: str | None,
     page: int,
     page_size: int,
+    offering: str | None = None,
+    te_approver: str | None = None,
+    chg_bucket: str | None = None,
 ) -> dict:
     conditions = ["e.active = TRUE"]
     params: list = []
@@ -33,6 +37,21 @@ async def list_employees(
         conditions.append("fu.chargeability_pct >= 50 AND fu.chargeability_pct < 80")
     elif status == "red":
         conditions.append("fu.chargeability_pct < 50 AND COALESCE(e.charge, TRUE) = TRUE")
+
+    if offering:
+        params.append(offering)
+        conditions.append(f"fu.offering = ${len(params)}")
+
+    if te_approver:
+        params.append(f"%{te_approver}%")
+        conditions.append(f"fu.te_approver ILIKE ${len(params)}")
+
+    if chg_bucket == "over":
+        conditions.append("fp_cur.chg_pct_hl > 100")
+    elif chg_bucket == "full":
+        conditions.append("fp_cur.chg_pct_hl = 100")
+    elif chg_bucket == "under":
+        conditions.append("fp_cur.chg_pct_hl < 100")
 
     where = " AND ".join(conditions)
     offset = (page - 1) * page_size
@@ -56,7 +75,7 @@ async def list_employees(
                 COALESCE(e.fte, 1.0) AS "FTE",
                 TO_CHAR(e.hire_date,'DD/MM/YY') AS "HireDate",
                 COALESCE(pl.name, e.people_lead::text) AS "Manager",
-                COALESCE(te.name, fu.te_approver::text) AS "TEApprover",
+                fu.te_approver AS "TEApprover",
                 fu.offering AS "ProjectType",
                 fu.client AS "Client",
                 COALESCE(am.name, fu.account_manager::text) AS "AccountManager",
@@ -74,12 +93,19 @@ async def list_employees(
                 e.new_joiner AS "NewJoiner",
                 TO_CHAR(e.termination_date,'DD/MM/YY') AS "TerminationDate",
                 COALESCE(e.charge, TRUE) AS "Charge",
+                COALESCE(e.ringfenced, FALSE) AS "Ringfenced",
                 COUNT(*) OVER () AS _total
             FROM employees e
             LEFT JOIN latest_fu fu ON e.eid = fu.eid
             LEFT JOIN employees pl ON e.people_lead = pl.eid
             LEFT JOIN employees am ON fu.account_manager = am.eid
-            LEFT JOIN employees te ON fu.te_approver = te.eid
+            LEFT JOIN (
+                SELECT DISTINCT ON (fp.eid) fp.eid, fp.chg_pct_hl
+                FROM forecast_periods fp
+                JOIN periods p ON fp.period_name = p.period_name
+                WHERE p.start_date <= CURRENT_DATE AND p.end_date >= CURRENT_DATE
+                ORDER BY fp.eid
+            ) fp_cur ON fp_cur.eid = e.eid
             WHERE {where}
             ORDER BY COALESCE(e.country, e.location), e.name
             LIMIT ${limit_idx} OFFSET ${offset_idx}
@@ -160,6 +186,7 @@ async def list_employees(
             "DaysToAvailable": float(row.get("DaysToAvailable") or 0),
             "NextPTOHours": float(row.get("NextPTOHours") or 0),
             "Charge": row.get("Charge") is not False,
+            "Ringfenced": bool(row.get("Ringfenced") or False),
         })
         employees.append(row)
 
@@ -206,16 +233,17 @@ async def update(eid: str, body: EmployeeUpdate, request_id: str) -> dict:
                 if taken:
                     raise ForecastException(AppError.EMPLOYEE_EID_TAKEN)
 
-            if body.new_eid or body.name or body.cl is not None:
+            if body.new_eid or body.name or body.cl is not None or body.ringfenced is not None:
                 await conn.execute(
                     """
                     UPDATE employees SET
-                        eid  = COALESCE($1, eid),
-                        name = COALESCE($2, name),
-                        cl   = COALESCE($3, cl)
+                        eid        = COALESCE($1, eid),
+                        name       = COALESCE($2, name),
+                        cl         = COALESCE($3, cl),
+                        ringfenced = COALESCE($5, ringfenced)
                     WHERE eid = $4
                     """,
-                    body.new_eid or None, body.name or None, body.cl, eid,
+                    body.new_eid or None, body.name or None, body.cl, eid, body.ringfenced,
                 )
                 if body.new_eid and body.new_eid != eid:
                     await conn.execute("UPDATE forecast_update SET eid=$1 WHERE eid=$2", body.new_eid, eid)
@@ -283,7 +311,7 @@ async def get_employee(eid: str) -> dict:
                 COALESCE(e.fte, 1.0) AS "FTE",
                 TO_CHAR(e.hire_date,'DD/MM/YY') AS "HireDate",
                 COALESCE(pl.name, e.people_lead::text) AS "Manager",
-                COALESCE(te.name, fu.te_approver::text) AS "TEApprover",
+                fu.te_approver AS "TEApprover",
                 fu.offering AS "ProjectType",
                 fu.client AS "Client",
                 COALESCE(am.name, fu.account_manager::text) AS "AccountManager",
@@ -300,12 +328,12 @@ async def get_employee(eid: str) -> dict:
                 fu.notes AS "Notes",
                 e.new_joiner AS "NewJoiner",
                 TO_CHAR(e.termination_date,'DD/MM/YY') AS "TerminationDate",
-                COALESCE(e.charge, TRUE) AS "Charge"
+                COALESCE(e.charge, TRUE) AS "Charge",
+                COALESCE(e.ringfenced, FALSE) AS "Ringfenced"
             FROM employees e
             LEFT JOIN latest_fu fu ON e.eid = fu.eid
             LEFT JOIN employees pl ON e.people_lead = pl.eid
             LEFT JOIN employees am ON fu.account_manager = am.eid
-            LEFT JOIN employees te ON fu.te_approver = te.eid
             WHERE e.eid = $1
         """, eid)
 
@@ -357,5 +385,53 @@ async def get_employee(eid: str) -> dict:
         "DaysToAvailable": float(result.get("DaysToAvailable") or 0),
         "NextPTOHours": float(result.get("NextPTOHours") or 0),
         "Charge": result.get("Charge") is not False,
+        "Ringfenced": bool(result.get("Ringfenced") or False),
     })
     return result
+
+
+async def assign_real_eid(old_eid: str, new_eid: str, new_name: str | None, request_id: str) -> dict:
+    async with db.pool.acquire() as conn:
+        async with conn.transaction():
+            try:
+                emp = await conn.fetchrow("SELECT new_joiner FROM employees WHERE eid=$1", old_eid)
+                if not emp:
+                    raise ForecastException(AppError.EMPLOYEE_NOT_FOUND)
+                if not emp["new_joiner"]:
+                    raise ForecastException(AppError.VALIDATION_ERROR, "Employee is not a new joiner")
+
+                existing = await conn.fetchrow("SELECT new_joiner FROM employees WHERE eid=$1", new_eid)
+                if existing and not existing["new_joiner"]:
+                    raise ForecastException(AppError.EMPLOYEE_EID_TAKEN)
+
+                # INSERT new row first so FK references (forecast_update → employees) stay valid
+                # during the transition. Then update child tables, then remove old row.
+                await conn.execute(
+                    """
+                    INSERT INTO employees (eid, name, country, location, cl, fte, active,
+                        hire_date, termination_date, people_lead, new_joiner, charge, ringfenced)
+                    SELECT $1, COALESCE($2, name), country, location, cl, fte, active,
+                        hire_date, termination_date, people_lead, FALSE, charge, ringfenced
+                    FROM employees WHERE eid=$3
+                    """,
+                    new_eid, new_name or None, old_eid,
+                )
+                await conn.execute("UPDATE forecast_update SET eid=$1 WHERE eid=$2", new_eid, old_eid)
+                await conn.execute("UPDATE forecast_periods SET eid=$1 WHERE eid=$2", new_eid, old_eid)
+                await conn.execute("UPDATE chargeability_blocks SET eid=$1 WHERE eid=$2", new_eid, old_eid)
+                await conn.execute("UPDATE absences SET eid=$1 WHERE eid=$2", new_eid, old_eid)
+                await conn.execute("UPDATE tickets SET eid=$1 WHERE eid=$2", new_eid, old_eid)
+                await conn.execute("UPDATE ppa_log SET eid=$1 WHERE eid=$2", new_eid, old_eid)
+                await conn.execute("UPDATE users SET eid=$1 WHERE eid=$2", new_eid, old_eid)
+                await conn.execute("DELETE FROM employees WHERE eid=$1", old_eid)
+
+                logger.bind(request_id=request_id).info("NJ EID assigned", old_eid=old_eid, new_eid=new_eid)
+
+            except ForecastException:
+                raise
+            except Exception:
+                logger.bind(request_id=request_id).exception("Unexpected error assigning real EID", old_eid=old_eid, new_eid=new_eid)
+                raise ForecastException(AppError.INTERNAL_ERROR)
+
+    await recalculate_service.recalculate_employee(new_eid, request_id)
+    return {"ok": True, "new_eid": new_eid}

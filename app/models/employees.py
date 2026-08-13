@@ -2,6 +2,11 @@ from typing import Optional
 from pydantic import BaseModel
 
 
+class AssignEidBody(BaseModel):
+    new_eid: str
+    new_name: Optional[str] = None
+
+
 class EmployeeUpdate(BaseModel):
     new_eid: Optional[str] = None
     name: Optional[str] = None
@@ -14,3 +19,4 @@ class EmployeeUpdate(BaseModel):
     notes: Optional[str] = None
     next_client: Optional[str] = None
     chargeability_pct: Optional[float] = None
+    ringfenced: Optional[bool] = None

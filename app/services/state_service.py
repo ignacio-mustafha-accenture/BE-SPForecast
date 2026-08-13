@@ -130,7 +130,8 @@ async def get_state(window_offset: int = 0) -> dict:
                 fu.notes AS "Notes",
                 e.new_joiner AS "NewJoiner",
                 TO_CHAR(e.termination_date,'DD/MM/YY') AS "TerminationDate",
-                COALESCE(e.charge, TRUE) AS "Charge"
+                COALESCE(e.charge, TRUE) AS "Charge",
+                COALESCE(e.ringfenced, FALSE) AS "Ringfenced"
             FROM employees e
             LEFT JOIN latest_fu fu ON e.eid = fu.eid
             LEFT JOIN employees pl ON e.people_lead = pl.eid
@@ -202,6 +203,7 @@ async def get_state(window_offset: int = 0) -> dict:
                 "NextPTOHours": float(row.get("NextPTOHours") or 0),
                 "Charge": row.get("Charge") is not False,
                 "IsOnPTO": row["EID"] in active_pto_eids,
+                "Ringfenced": bool(row.get("Ringfenced") or False),
             })
             employees.append(row)
 
