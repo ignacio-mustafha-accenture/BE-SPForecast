@@ -21,8 +21,16 @@ async def list_employees(
     params: list = []
 
     if country:
-        countries = [c.strip().lower() for c in country.split(',') if c.strip()]
-        params.append(countries)
+        COUNTRY_VARIANTS: dict[str, list[str]] = {
+            'ar': ['ar', 'argentina'],
+            'mx': ['mx', 'mexico', 'méxico'],
+            'cr': ['cr', 'costa rica'],
+        }
+        expanded: list[str] = []
+        for c in country.split(','):
+            key = c.strip().lower()
+            expanded.extend(COUNTRY_VARIANTS.get(key, [key]))
+        params.append(expanded)
         conditions.append(f"LOWER(COALESCE(e.country, e.location)) = ANY(${len(params)})")
 
     if q:

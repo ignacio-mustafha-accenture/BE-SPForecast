@@ -188,17 +188,6 @@ async def create(body: TicketCreate, created_by: str, request_id: str) -> dict:
         async with db.pool.acquire() as conn:
             async with conn.transaction():
                 try:
-                    if body.type == "newproj" and body.eid and body.client_name:
-                        existing = await conn.fetchrow(
-                            "SELECT id FROM tickets WHERE type='newproj' AND eid=$1 AND client_name=$2 AND status='Approved' LIMIT 1",
-                            body.eid, body.client_name,
-                        )
-                        if existing:
-                            raise ForecastException(
-                                AppError.VALIDATION_ERROR,
-                                "Ya existe una asignación activa para este empleado y cliente. Usá un ticket 'En Curso'.",
-                            )
-
                     if body.eid and body.type not in ("nj",):
                         emp = await conn.fetchrow("SELECT eid FROM employees WHERE eid=$1", body.eid)
                         if not emp:
@@ -407,8 +396,9 @@ async def _apply_approval_side_effects(conn, ticket: dict, request_id: str):
         if scenario == "assumption":
             end_date_str = ticket.get("end_date")
             if end_date_str:
+                # Borrar todos los bloques del empleado (effective + assumption)
                 await conn.execute(
-                    "DELETE FROM chargeability_blocks WHERE eid=$1 AND scenario_type='assumption'",
+                    "DELETE FROM chargeability_blocks WHERE eid=$1",
                     eid,
                 )
                 num = await get_assumption_num(
@@ -429,6 +419,11 @@ async def _apply_approval_side_effects(conn, ticket: dict, request_id: str):
             end_date_str = ticket.get("end_date")
             chargeability_pct = ticket.get("chargeability_pct") or 0
             if start_date_str and end_date_str:
+                # Borrar todos los bloques effective viejos del empleado
+                await conn.execute(
+                    "DELETE FROM chargeability_blocks WHERE eid=$1",
+                    eid,
+                )
                 periods = await conn.fetch(
                     """
                     SELECT period_name, start_date, end_date FROM periods
@@ -438,14 +433,6 @@ async def _apply_approval_side_effects(conn, ticket: dict, request_id: str):
                     start_date_str, end_date_str,
                 )
                 for period in periods:
-                    await conn.execute(
-                        "DELETE FROM chargeability_blocks WHERE eid=$1 AND period_name=$2 AND scenario_type='effective'",
-                        eid, period["period_name"],
-                    )
-                    await conn.execute(
-                        "DELETE FROM chargeability_blocks WHERE eid=$1 AND period_name=$2 AND scenario_type='assumption'",
-                        eid, period["period_name"],
-                    )
                     await conn.execute(
                         """
                         INSERT INTO chargeability_blocks
@@ -460,11 +447,17 @@ async def _apply_approval_side_effects(conn, ticket: dict, request_id: str):
                     "Effective chargeability blocks created",
                     eid=eid, periods=len(periods), pct=chargeability_pct,
                 )
-                # Assumption tipo 1 para períodos posteriores al roll-off
+                # Assumption post roll-off según el perfil del empleado
+                num = await get_assumption_num(
+                    conn,
+                    client_name=ticket.get("client_name"),
+                    is_nj=False,
+                    eid=eid,
+                )
                 await upsert_projection_blocks(
                     conn, eid,
                     ref_date=_d.fromisoformat(end_date_str),
-                    num=1,
+                    num=num,
                     effectivization_date=None,
                     request_id=request_id,
                 )
