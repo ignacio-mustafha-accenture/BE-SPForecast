@@ -37,6 +37,12 @@ app = FastAPI(title="ForecastOS API", lifespan=lifespan)
 
 @app.exception_handler(ForecastException)
 async def forecast_handler(request: Request, exc: ForecastException):
+    logger.warning(
+        "ForecastException | path={} | code={} | detail={}",
+        request.url.path,
+        exc.error.code,
+        exc.extra or exc.error.detail,
+    )
     return JSONResponse(
         status_code=exc.error.status,
         content={"code": exc.error.code, "detail": exc.extra or exc.error.detail},
@@ -45,6 +51,17 @@ async def forecast_handler(request: Request, exc: ForecastException):
 
 @app.exception_handler(RequestValidationError)
 async def validation_handler(request: Request, exc: RequestValidationError):
+    try:
+        body = await request.body()
+        body_text = body.decode("utf-8", errors="replace")
+    except Exception:
+        body_text = "<unreadable>"
+    logger.warning(
+        "422 Validation error | path={} | errors={} | body={}",
+        request.url.path,
+        exc.errors(),
+        body_text,
+    )
     return JSONResponse(
         status_code=422,
         content={"code": AppError.VALIDATION_ERROR.code, "detail": exc.errors()},

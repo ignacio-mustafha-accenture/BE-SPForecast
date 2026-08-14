@@ -156,10 +156,16 @@ async def get_ticket(ticket_id: int) -> dict:
 
 
 async def create(body: TicketCreate, created_by: str, request_id: str) -> dict:
+    logger.bind(request_id=request_id).info(
+        "ticket create body | {}",
+        body.model_dump(),
+    )
     if body.type not in VALID_TICKET_TYPES:
         raise ForecastException(AppError.TICKET_INVALID_TYPE)
 
-    required = REQUIRED_FIELDS.get(body.type, [])
+    required = list(REQUIRED_FIELDS.get(body.type, []))
+    if body.type == "newproj" and body.scenario_type == "assumption":
+        required = [f for f in required if f not in ("chargeability_pct", "start_date")]
     for field in required:
         if not getattr(body, field, None):
             raise ForecastException(AppError.TICKET_MISSING_FIELDS)
@@ -169,7 +175,7 @@ async def create(body: TicketCreate, created_by: str, request_id: str) -> dict:
 
     effective_end_date = body.end_date or body.new_end_date or body.start_date
 
-    if body.effectivization_date and effective_end_date:
+    if body.scenario_type != "assumption" and body.effectivization_date and effective_end_date:
         from datetime import date as _date
         try:
             eff_date = _date.fromisoformat(body.effectivization_date)
