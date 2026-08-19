@@ -1,15 +1,12 @@
-"""
-migrate_data.py
-
-Copia los datos de todas las tablas de Supabase a Azure PostgreSQL.
-Uso: python migrate_data.py
-"""
-
 import asyncio
 import asyncpg
 import logging
+import os
 import sys
 from datetime import datetime
+from dotenv import load_dotenv
+
+load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -19,20 +16,20 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 SUPABASE = dict(
-    host='aws-0-us-east-1.pooler.supabase.com',
-    port=5432,
-    database='postgres',
-    user='postgres.zurbiimjoujcocdffdlv',
-    password='Forecast989134@@',
+    host=os.getenv('SUPABASE_DB_HOST'),
+    port=int(os.getenv('DB_PORT', 5432)),
+    user=os.getenv('SUPABASE_DB_USER'),
+    password=os.getenv('SUPABASE_DB_PASSWORD'),
+    database=os.getenv('SUPABASE_DB_NAME'),
     ssl='require',
 )
 
 AZURE = dict(
-    host='forecast-db-dev.postgres.database.azure.com',
-    port=5432,
-    database='forecast',
-    user='forecastadmin',
-    password='Forecast2026@Secure!',
+    host=os.getenv('DB_HOST'),
+    port=int(os.getenv('DB_PORT', 5432)),
+    user=os.getenv('DB_USER'),
+    password=os.getenv('DB_PASSWORD'),
+    database=os.getenv('DB_NAME'),
     ssl='require',
 )
 
@@ -63,7 +60,6 @@ BATCH_SIZE = 500
 
 
 async def migrate_table(src, dst, table: str) -> int:
-    # Obtener columnas
     cols = await src.fetch("""
         SELECT column_name FROM information_schema.columns
         WHERE table_schema = 'public' AND table_name = $1
@@ -75,21 +71,17 @@ async def migrate_table(src, dst, table: str) -> int:
         log.warning(f'  {table}: sin columnas, saltando.')
         return 0
 
-    # Limpiar tabla destino antes de insertar
     await dst.execute(f'TRUNCATE TABLE {table} CASCADE')
 
-    # Leer de Supabase
     rows = await src.fetch(f'SELECT * FROM {table}')
     if not rows:
         log.info(f'  {table}: vacia, saltando.')
         return 0
 
-    # Construir query de insercion
     placeholders = ', '.join(f'${i+1}' for i in range(len(col_names)))
     col_list     = ', '.join(col_names)
     insert_sql   = f'INSERT INTO {table} ({col_list}) VALUES ({placeholders})'
 
-    # Insertar en lotes
     inserted = 0
     data = [tuple(r[c] for c in col_names) for r in rows]
 
@@ -102,6 +94,10 @@ async def migrate_table(src, dst, table: str) -> int:
 
 
 async def run():
+    if not all([SUPABASE['host'], AZURE['host']]):
+        log.error('Variables de entorno incompletas. Verificar .env')
+        sys.exit(1)
+
     start = datetime.now()
     log.info('=== Migrando datos Supabase -> Azure ===')
 
@@ -121,7 +117,6 @@ async def run():
             except Exception as e:
                 log.warning(f'  WARN {table}: {e}')
                 errors.append((table, str(e)))
-
     finally:
         await src.close()
         await dst.close()
