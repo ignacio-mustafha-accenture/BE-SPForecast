@@ -1,15 +1,12 @@
-"""
-migrate_schema.py
-Extrae el schema completo de Supabase y lo aplica en Azure PostgreSQL.
-Uso: python migrate_schema.py  (desde la carpeta BE-SPForecast)
-"""
-
 import asyncio
 import asyncpg
 import logging
 import sys
 import os
 from datetime import datetime
+from dotenv import load_dotenv
+
+load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -19,20 +16,20 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 SUPABASE = dict(
-    host='aws-0-us-east-1.pooler.supabase.com',
-    port=5432,
-    database='postgres',
-    user='postgres.zurbiimjoujcocdffdlv',
-    password='Forecast989134@@',
+    host=os.getenv('SUPABASE_DB_HOST'),
+    port=int(os.getenv('DB_PORT', 5432)),
+    user=os.getenv('SUPABASE_DB_USER'),
+    password=os.getenv('SUPABASE_DB_PASSWORD'),
+    database=os.getenv('SUPABASE_DB_NAME'),
     ssl='require',
 )
 
 AZURE = dict(
-    host='forecast-db-dev.postgres.database.azure.com',
-    port=5432,
-    database='forecast',
-    user='forecastadmin',
-    password='Forecast2026@Secure!',
+    host=os.getenv('DB_HOST'),
+    port=int(os.getenv('DB_PORT', 5432)),
+    user=os.getenv('DB_USER'),
+    password=os.getenv('DB_PASSWORD'),
+    database=os.getenv('DB_NAME'),
     ssl='require',
 )
 
@@ -153,6 +150,10 @@ async def apply_sql(dst, sql, label):
 
 
 async def run_migration():
+    if not all([SUPABASE['host'], AZURE['host']]):
+        log.error('Variables de entorno incompletas. Verificar .env')
+        sys.exit(1)
+
     start = datetime.now()
     log.info('=== Iniciando migracion Supabase -> Azure ===')
 
