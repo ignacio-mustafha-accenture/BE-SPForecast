@@ -141,13 +141,34 @@ async def get_state(window_offset: int = 0) -> dict:
             ORDER BY COALESCE(e.country, e.location), e.name
         """)
 
-        # --- Forecast map ---
+        # --- Forecast map desde employee_daily_hours (calculo dia a dia) ---
+        # CHG% HL = (chg_hl + chg_ppa) / sah * 100
+        # CHG% SL = (chg_hl + chg_sl + chg_ppa) / sah * 100
         fp_rows = await conn.fetch(
-            """SELECT eid, period_name, chg, sah,
-                      chg_hl, chg_sl, chg_cascadeadas, absence_hours, chg_pct_sl, chg_pct_hl
-               FROM forecast_periods WHERE period_name = ANY($1)""",
+            """
+            SELECT
+                edh.eid,
+                p.period_name,
+                SUM(edh.sah)                                                        AS sah,
+                SUM(edh.chg_hl)                                                     AS chg_hl,
+                SUM(edh.chg_sl)                                                     AS chg_sl,
+                SUM(edh.chg_ppa)                                                    AS chg_cascadeadas,
+                SUM(edh.chg_hl + edh.chg_sl + edh.chg_ppa)                         AS chg,
+                0                                                                   AS absence_hours,
+                CASE WHEN SUM(edh.sah) > 0
+                     THEN ROUND(SUM(edh.chg_hl + edh.chg_ppa) / SUM(edh.sah) * 100, 2)
+                     ELSE 0 END                                                     AS chg_pct_hl,
+                CASE WHEN SUM(edh.sah) > 0
+                     THEN ROUND(SUM(edh.chg_hl + edh.chg_sl + edh.chg_ppa) / SUM(edh.sah) * 100, 2)
+                     ELSE 0 END                                                     AS chg_pct_sl
+            FROM employee_daily_hours edh
+            JOIN periods p ON edh.date BETWEEN p.start_date AND p.end_date
+            WHERE p.period_name = ANY($1)
+            GROUP BY edh.eid, p.period_name
+            """,
             period_names,
         )
+
         forecast_map: dict = {}
         for fp in fp_rows:
             if fp["eid"] not in forecast_map:
@@ -167,16 +188,15 @@ async def get_state(window_offset: int = 0) -> dict:
         for e in emp_rows:
             row = dict(e)
             fp = forecast_map.get(row["EID"], {})
-            chg_arr              = [float(fp.get(pn, {}).get("chg", 0))             for pn in period_names]
-            sah_arr              = [float(fp.get(pn, {}).get("sah", 0))             for pn in period_names]
-            chg_hl_arr           = [float(fp.get(pn, {}).get("chg_hl", 0))          for pn in period_names]
-            chg_sl_arr           = [float(fp.get(pn, {}).get("chg_sl", 0))          for pn in period_names]
-            chg_cascadeadas_arr  = [float(fp.get(pn, {}).get("chg_cascadeadas", 0)) for pn in period_names]
-            absence_hours_arr    = [float(fp.get(pn, {}).get("absence_hours", 0))   for pn in period_names]
-            chg_pct_sl_arr       = [float(fp.get(pn, {}).get("chg_pct_sl", 0))      for pn in period_names]
-            chg_pct_hl_arr       = [float(fp.get(pn, {}).get("chg_pct_hl", 0))      for pn in period_names]
-            # Effective if employee has any confirmed hours in current period;
-            # assumption only when 100% of CHG comes from assumption blocks
+            chg_arr             = [float(fp.get(pn, {}).get("chg", 0))             for pn in period_names]
+            sah_arr             = [float(fp.get(pn, {}).get("sah", 0))             for pn in period_names]
+            chg_hl_arr          = [float(fp.get(pn, {}).get("chg_hl", 0))          for pn in period_names]
+            chg_sl_arr          = [float(fp.get(pn, {}).get("chg_sl", 0))          for pn in period_names]
+            chg_cascadeadas_arr = [float(fp.get(pn, {}).get("chg_cascadeadas", 0)) for pn in period_names]
+            absence_hours_arr   = [float(fp.get(pn, {}).get("absence_hours", 0))   for pn in period_names]
+            chg_pct_sl_arr      = [float(fp.get(pn, {}).get("chg_pct_sl", 0))      for pn in period_names]
+            chg_pct_hl_arr      = [float(fp.get(pn, {}).get("chg_pct_hl", 0))      for pn in period_names]
+
             cur_fp = fp.get(period_names[0], {}) if period_names else {}
             is_assumption = (
                 float(cur_fp.get("chg_sl", 0)) > 0
