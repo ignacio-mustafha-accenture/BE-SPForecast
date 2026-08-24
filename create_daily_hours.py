@@ -7,6 +7,8 @@ from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from dotenv import load_dotenv
 
+from app.country import to_iso
+
 load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
 
 logging.basicConfig(
@@ -72,14 +74,15 @@ def distribute(total: Decimal, days: int) -> list:
 async def build_rows(conn: asyncpg.Connection) -> list:
     employees = await conn.fetch("""
         SELECT e.eid,
-               e.location AS country,
+               e.country,
+               e.location,
                MIN(cb.start_date) AS roll_on,
                MAX(cb.end_date)   AS roll_off
         FROM employees e
         LEFT JOIN chargeability_blocks cb
                ON cb.eid = e.eid AND cb.scenario_type = 'effective'
         WHERE e.termination_date IS NULL OR e.termination_date > CURRENT_DATE
-        GROUP BY e.eid, e.location
+        GROUP BY e.eid, e.country, e.location
     """)
     log.info(f'  {len(employees)} empleados activos')
     if not employees:
@@ -144,7 +147,7 @@ async def build_rows(conn: asyncpg.Connection) -> list:
         hours = Decimal(str(ppa['hours']))
         eid   = ppa['eid']
         emp   = next((e for e in employees if e['eid'] == eid), None)
-        country = emp['country'] if emp else 'AR'
+        country = to_iso(emp['country'], emp['location']) if emp else 'AR'
         h_set = holidays_by_country.get(country, set())
 
         for period_name, sign in [(ppa['to_period'], 1), (ppa['from_period'], -1)]:
@@ -164,7 +167,7 @@ async def build_rows(conn: asyncpg.Connection) -> list:
 
     for emp in employees:
         eid     = emp['eid']
-        country = emp['country'] or 'AR'
+        country = to_iso(emp['country'], emp['location'])
         h_set   = holidays_by_country.get(country, set())
         abs_set = absent_days.get(eid, set())
 
