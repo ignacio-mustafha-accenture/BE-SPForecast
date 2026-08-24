@@ -1,8 +1,80 @@
 import time
+from datetime import date, timedelta
 from loguru import logger
 import app.db as db
 from app.errors import AppError, ForecastException
 from app.models.ppa import PPACreate
+
+
+
+def _date_range(start: date, end: date):
+    cur = start
+    while cur <= end:
+        yield cur
+        cur += timedelta(days=1)
+
+
+def _is_weekday(d: date) -> bool:
+    return d.weekday() < 5
+
+
+async def _get_workdays(conn, period_name: str, country: str) -> list[date]:
+    """Días hábiles del período (L-V, sin feriados del país)."""
+    period = await conn.fetchrow(
+        "SELECT start_date, end_date FROM periods WHERE period_name=$1",
+        period_name,
+    )
+    if not period:
+        return []
+
+    holidays = await conn.fetch(
+        "SELECT date FROM holidays WHERE country=$1 AND date BETWEEN $2 AND $3",
+        country, period["start_date"], period["end_date"],
+    )
+    holiday_set = {h["date"] for h in holidays}
+
+    return [
+        d for d in _date_range(period["start_date"], period["end_date"])
+        if _is_weekday(d) and d not in holiday_set
+    ]
+
+
+async def _apply_ppa_to_daily_hours(
+    conn,
+    eid: str,
+    from_period: str,
+    to_period: str,
+    hours: int,
+    country: str,
+) -> None:
+    """
+    Distribuye las horas PPA día a día:
+      - from_period: chg_ppa -= hours/workdays
+      - to_period:   chg_ppa += hours/workdays
+    """
+    for period_name, sign in [(from_period, -1), (to_period, 1)]:
+        workdays = await _get_workdays(conn, period_name, country)
+        if not workdays:
+            logger.warning(f"No workdays found for period {period_name}, skipping PPA distribution")
+            continue
+
+        daily_hours = round(hours / len(workdays), 2) * sign
+
+        await conn.executemany(
+            """
+            INSERT INTO employee_daily_hours (eid, date, sah, chg_hl, chg_sl, chg_ppa, updated_at)
+            VALUES ($1, $2, 0, 0, 0, $3, NOW())
+            ON CONFLICT (eid, date) DO UPDATE SET
+                chg_ppa    = employee_daily_hours.chg_ppa + $3,
+                updated_at = NOW()
+            """,
+            [(eid, d, daily_hours) for d in workdays],
+        )
+
+    logger.info(
+        f"PPA applied to daily hours",
+        eid=eid, from_period=from_period, to_period=to_period, hours=hours,
+    )
 
 
 async def list_ppa(
@@ -57,36 +129,42 @@ async def create(body: PPACreate, created_by: str, request_id: str) -> dict:
 
     async with db.pool.acquire() as conn:
         async with conn.transaction():
-            emp = await conn.fetchrow("SELECT eid FROM employees WHERE eid=$1", body.eid)
+            emp = await conn.fetchrow(
+                "SELECT eid, COALESCE(country, location) AS country FROM employees WHERE eid=$1",
+                body.eid,
+            )
             if not emp:
                 raise ForecastException(AppError.EMPLOYEE_NOT_FOUND)
 
-            fp_src = await conn.fetchrow(
-                "SELECT id FROM forecast_periods WHERE eid=$1 AND period_name=$2",
-                body.eid, body.from_period,
-            )
-            if not fp_src:
-                raise ForecastException(AppError.PERIOD_NOT_FOUND)
+            for period_name in (body.from_period, body.to_period):
+                period = await conn.fetchrow(
+                    "SELECT period_name FROM periods WHERE period_name=$1",
+                    period_name,
+                )
+                if not period:
+                    raise ForecastException(
+                        AppError.PERIOD_NOT_FOUND,
+                        f"Período '{period_name}' no encontrado",
+                    )
 
             await conn.execute(
                 """
                 INSERT INTO ppa_log (eid, from_period, to_period, hours, reason, created_at, created_by)
-                VALUES ($1,$2,$3,$4,$5,NOW(),$6)
+                VALUES ($1, $2, $3, $4, $5, NOW(), $6)
                 """,
                 body.eid, body.from_period, body.to_period,
                 body.hours, body.reason or None, created_by or None,
             )
 
-            # Recalculate both periods via stored proc so ppa_adj is correctly populated
-            for period in (body.from_period, body.to_period):
-                try:
-                    await conn.execute(
-                        "SELECT recalculate_forecast_period($1,$2)", body.eid, period
-                    )
-                except Exception as e:
-                    logger.bind(request_id=request_id).warning(
-                        "Recalculate failed after PPA", period=period, error=str(e)
-                    )
+            country = emp["country"] or "AR"
+            await _apply_ppa_to_daily_hours(
+                conn,
+                eid=body.eid,
+                from_period=body.from_period,
+                to_period=body.to_period,
+                hours=body.hours,
+                country=country,
+            )
 
     duration = int((time.monotonic() - start) * 1000)
     logger.bind(action="ppa:create", request_id=request_id, duration_ms=duration).info(
