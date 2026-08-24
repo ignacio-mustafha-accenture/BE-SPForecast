@@ -13,5 +13,6 @@ RUN pip install --no-cache-dir --progress-bar off \
 
 COPY migrate_schema.py migrate_data.py create_daily_hours.py fix_sequences.py inspect_ppa.py ./
 COPY schema_auth.sql schema_clients.sql schema_holidays.sql ./
+COPY app/__init__.py app/country.py ./app/
 
 CMD ["python", "migrate_schema.py"]
