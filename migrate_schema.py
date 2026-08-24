@@ -158,7 +158,13 @@ async def extract_constraints(src):
         WHERE n.nspname = 'public'
           AND c.contype IN ('f', 'u', 'c')
           AND rel.relname = ANY($1::text[])
-        ORDER BY c.contype, rel.relname, c.conname
+        ORDER BY CASE c.contype
+                     WHEN 'u' THEN 1
+                     WHEN 'c' THEN 2
+                     WHEN 'f' THEN 3
+                     ELSE 4
+                 END,
+                 rel.relname, c.conname
     """, TABLES)
 
     statements = []
@@ -266,20 +272,6 @@ async def run_migration():
     total_failed = 0
 
     try:
-        log.info('Aplicando archivos SQL versionados...')
-        for filepath in EXTRA_SQL_FILES:
-            if not os.path.exists(filepath):
-                log.warning(f'  {os.path.basename(filepath)} no encontrado, saltando.')
-                continue
-            with open(filepath, encoding='utf-8') as fh:
-                sql = fh.read()
-            try:
-                await dst.execute(sql)
-                log.info(f'  OK {os.path.basename(filepath)}')
-            except asyncpg.PostgresError as e:
-                total_failed += 1
-                log.warning(f'  FALLO {os.path.basename(filepath)}: {e}')
-
         tables = await extract_tables(src)
         total_failed += await apply_statements(dst, tables, 'tablas')
 
@@ -291,6 +283,19 @@ async def run_migration():
 
         functions = await extract_functions(src)
         total_failed += await apply_statements(dst, functions, 'rutinas')
+
+        log.info('Aplicando archivos SQL de bootstrap (no criticos)...')
+        for filepath in EXTRA_SQL_FILES:
+            if not os.path.exists(filepath):
+                log.warning(f'  {os.path.basename(filepath)} no encontrado, saltando.')
+                continue
+            with open(filepath, encoding='utf-8') as fh:
+                sql = fh.read()
+            try:
+                await dst.execute(sql)
+                log.info(f'  OK {os.path.basename(filepath)}')
+            except asyncpg.PostgresError as e:
+                log.warning(f'  OMITIDO {os.path.basename(filepath)}: {e}')
 
         present = await dst.fetch("""
             SELECT table_name FROM information_schema.tables

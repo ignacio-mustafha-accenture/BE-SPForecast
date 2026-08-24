@@ -203,9 +203,15 @@ async def run(apply: bool):
     log.info(f'=== {total_src if not apply else total:,} filas en {elapsed:.1f}s ===')
 
 
+def apply_requested() -> bool:
+    if '--yes' in sys.argv:
+        return True
+    return os.getenv('MIGRATE_APPLY', '').strip().lower() in ('1', 'true', 'yes')
+
+
 if __name__ == '__main__':
     try:
-        asyncio.run(run(apply='--yes' in sys.argv))
+        asyncio.run(run(apply=apply_requested()))
     except Exception as e:
         log.error(f'Error fatal: {e}')
         sys.exit(1)
