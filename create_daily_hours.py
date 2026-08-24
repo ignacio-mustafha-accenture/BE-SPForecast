@@ -60,6 +60,15 @@ def workdays(start: date, end: date, holidays: set) -> list:
     return [d for d in date_range(start, end) if is_weekday(d) and d not in holidays]
 
 
+def distribute(total: Decimal, days: int) -> list:
+    cents = int((Decimal(total) * 100).to_integral_value(ROUND_HALF_UP))
+    base, remainder = divmod(cents, days)
+    return [
+        Decimal(base + (1 if i < remainder else 0)) / 100
+        for i in range(days)
+    ]
+
+
 async def build_rows(conn: asyncpg.Connection) -> list:
     employees = await conn.fetch("""
         SELECT e.eid,
@@ -145,10 +154,10 @@ async def build_rows(conn: asyncpg.Connection) -> list:
             wdays = workdays(period['start_date'], period['end_date'], h_set)
             if not wdays:
                 continue
-            daily = (hours / len(wdays) * sign).quantize(TWO, ROUND_HALF_UP)
-            for d in wdays:
+            amounts = distribute(hours, len(wdays))
+            for d, amount in zip(wdays, amounts):
                 key = (eid, d)
-                ppa_by_eid_date[key] = ppa_by_eid_date.get(key, Decimal('0')) + daily
+                ppa_by_eid_date[key] = ppa_by_eid_date.get(key, Decimal('0')) + amount * sign
 
     log.info('Calculando horas diarias...')
     rows = []
