@@ -11,7 +11,7 @@ RUN pip install --no-cache-dir --progress-bar off \
         asyncpg==0.31.0 \
         python-dotenv==1.2.3
 
-COPY migrate_schema.py migrate_data.py create_daily_hours.py fix_sequences.py ./
+COPY migrate_schema.py migrate_data.py create_daily_hours.py fix_sequences.py inspect_ppa.py ./
 COPY schema_auth.sql schema_clients.sql schema_holidays.sql ./
 
 CMD ["python", "migrate_schema.py"]
