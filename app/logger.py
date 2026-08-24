@@ -1,5 +1,6 @@
 import sys
 import json
+import traceback
 from loguru import logger
 
 
@@ -20,8 +21,14 @@ def serialize(record) -> str:
         },
     }
     if record["exception"]:
-        entry["exception"] = str(record["exception"])
+        entry["exception"] = "".join(
+            traceback.format_exception(*record["exception"])
+        ).rstrip()
     return json.dumps(entry)
+
+
+def json_sink(message) -> None:
+    sys.stdout.write(serialize(message.record) + "\n")
 
 
 def setup_logging(log_level: str, log_format: str):
@@ -29,7 +36,7 @@ def setup_logging(log_level: str, log_format: str):
     # Provide defaults so format strings never raise KeyError outside a request context
     logger.configure(extra={"request_id": "-", "user_id": None, "user_email": None, "action": None, "duration_ms": None})
     if log_format == "json":
-        logger.add(sys.stdout, level=log_level, format=serialize, serialize=False)
+        logger.add(json_sink, level=log_level)
     else:
         logger.add(
             sys.stdout,
