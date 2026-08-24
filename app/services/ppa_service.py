@@ -3,6 +3,7 @@ from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from loguru import logger
 import app.db as db
+from app.country import to_iso
 from app.errors import AppError, ForecastException
 from app.models.ppa import PPACreate
 
@@ -142,7 +143,7 @@ async def create(body: PPACreate, created_by: str, request_id: str) -> dict:
     async with db.pool.acquire() as conn:
         async with conn.transaction():
             emp = await conn.fetchrow(
-                "SELECT eid, COALESCE(country, location) AS country FROM employees WHERE eid=$1",
+                "SELECT eid, country, location FROM employees WHERE eid=$1",
                 body.eid,
             )
             if not emp:
@@ -168,7 +169,7 @@ async def create(body: PPACreate, created_by: str, request_id: str) -> dict:
                 body.hours, body.reason or None, created_by or None,
             )
 
-            country = emp["country"] or "AR"
+            country = to_iso(emp["country"], emp["location"])
             await _apply_ppa_to_daily_hours(
                 conn,
                 eid=body.eid,

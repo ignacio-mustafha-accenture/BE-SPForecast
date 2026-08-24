@@ -7,6 +7,8 @@ from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from dotenv import load_dotenv
 
+from app.country import to_iso
+
 load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
 
 logging.basicConfig(level=logging.INFO, format='%(message)s')
@@ -58,19 +60,20 @@ async def run():
             log.info(f"  country={r['country']!r:<20} feriados={r['n']}")
 
         log.info('=== 3. cuantos empleados matchean feriados con cada estrategia ===')
-        r = await conn.fetchrow("""
-            SELECT
-              COUNT(*) FILTER (WHERE EXISTS (
-                SELECT 1 FROM holidays h WHERE h.country = COALESCE(e.country, e.location)
-              )) AS live_match,
-              COUNT(*) FILTER (WHERE EXISTS (
-                SELECT 1 FROM holidays h WHERE h.country = e.location
-              )) AS batch_match,
-              COUNT(*) AS total
-            FROM employees e
-        """)
-        log.info(f"  servicio en vivo COALESCE(country,location): {r['live_match']}/{r['total']}")
-        log.info(f"  batch location:                              {r['batch_match']}/{r['total']}")
+        valid = {r['country'] for r in await conn.fetch('SELECT DISTINCT country FROM holidays')}
+        emps = await conn.fetch('SELECT eid, country, location FROM employees')
+        live = sum(1 for e in emps if (e['country'] or e['location']) in valid)
+        batch = sum(1 for e in emps if e['location'] in valid)
+        iso = sum(1 for e in emps if to_iso(e['country'], e['location']) in valid)
+        log.info(f"  viejo servicio COALESCE(country,location): {live}/{len(emps)}")
+        log.info(f"  viejo batch location:                      {batch}/{len(emps)}")
+        log.info(f"  normalizado a ISO:                         {iso}/{len(emps)}")
+        sin_resolver = [
+            (e['eid'], e['country'], e['location']) for e in emps
+            if to_iso(e['country'], e['location']) not in valid
+        ]
+        for eid, c, l in sin_resolver:
+            log.info(f"  SIN RESOLVER: eid={eid} country={c!r} location={l!r}")
 
         log.info('=== 4. ppa_log ===')
         ppas = await conn.fetch("""
@@ -89,11 +92,13 @@ async def run():
         for p in ppas:
             live_country = p['country'] or p['location'] or 'AR'
             batch_country = p['location'] or 'AR'
+            iso_country = to_iso(p['country'], p['location'])
             log.info(f"  --- ppa id={p['id']} eid={p['eid']} {p['from_period']} -> {p['to_period']} "
                      f"hours={p['hours']}")
-            log.info(f"      pais segun servicio={live_country!r}  segun batch={batch_country!r}")
+            log.info(f"      pais viejo servicio={live_country!r} viejo batch={batch_country!r} "
+                     f"normalizado={iso_country!r}")
 
-            for label, ctry in (('live', live_country), ('batch', batch_country)):
+            for label, ctry in (('live', live_country), ('batch', batch_country), ('iso', iso_country)):
                 hs = {h['date'] for h in await conn.fetch(
                     'SELECT date FROM holidays WHERE country=$1', ctry
                 )}
