@@ -1,4 +1,4 @@
-from typing import Optional
+﻿from typing import Optional
 from pydantic import BaseModel
 
 
@@ -12,7 +12,8 @@ class EmployeeUpdate(BaseModel):
     name: Optional[str] = None
     cl: Optional[float] = None
     client: Optional[str] = None
-    offering: Optional[str] = None
+    offering: Optional[str] = None           # offering del proyecto (forecast_update)
+    employee_offering: Optional[str] = None  # offering del empleado (employees.offering)
     roll_on: Optional[str] = None
     roll_off: Optional[str] = None
     account_manager: Optional[str] = None
