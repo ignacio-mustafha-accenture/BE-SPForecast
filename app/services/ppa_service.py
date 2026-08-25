@@ -1,7 +1,9 @@
 import time
 from datetime import date, timedelta
+from decimal import Decimal, ROUND_HALF_UP
 from loguru import logger
 import app.db as db
+from app.country import to_iso
 from app.errors import AppError, ForecastException
 from app.models.ppa import PPACreate
 
@@ -16,6 +18,16 @@ def _date_range(start: date, end: date):
 
 def _is_weekday(d: date) -> bool:
     return d.weekday() < 5
+
+
+def _distribute(total: Decimal, days: int) -> list[Decimal]:
+    """Reparte total en days montos de 2 decimales cuya suma es exactamente total."""
+    cents = int((Decimal(total) * 100).to_integral_value(ROUND_HALF_UP))
+    base, remainder = divmod(cents, days)
+    return [
+        Decimal(base + (1 if i < remainder else 0)) / 100
+        for i in range(days)
+    ]
 
 
 async def _get_workdays(conn, period_name: str, country: str) -> list[date]:
@@ -48,9 +60,10 @@ async def _apply_ppa_to_daily_hours(
     country: str,
 ) -> None:
     """
-    Distribuye las horas PPA día a día:
-      - from_period: chg_ppa -= hours/workdays
-      - to_period:   chg_ppa += hours/workdays
+    Distribuye las horas PPA entre los días hábiles del período:
+      - from_period: chg_ppa -= hours
+      - to_period:   chg_ppa += hours
+    El reparto por día suma exactamente hours en cada período.
     """
     for period_name, sign in [(from_period, -1), (to_period, 1)]:
         workdays = await _get_workdays(conn, period_name, country)
@@ -58,7 +71,7 @@ async def _apply_ppa_to_daily_hours(
             logger.warning(f"No workdays found for period {period_name}, skipping PPA distribution")
             continue
 
-        daily_hours = round(hours / len(workdays), 2) * sign
+        amounts = _distribute(Decimal(hours), len(workdays))
 
         await conn.executemany(
             """
@@ -68,7 +81,7 @@ async def _apply_ppa_to_daily_hours(
                 chg_ppa    = employee_daily_hours.chg_ppa + $3,
                 updated_at = NOW()
             """,
-            [(eid, d, daily_hours) for d in workdays],
+            [(eid, d, amount * sign) for d, amount in zip(workdays, amounts)],
         )
 
     logger.info(
@@ -130,7 +143,7 @@ async def create(body: PPACreate, created_by: str, request_id: str) -> dict:
     async with db.pool.acquire() as conn:
         async with conn.transaction():
             emp = await conn.fetchrow(
-                "SELECT eid, COALESCE(country, location) AS country FROM employees WHERE eid=$1",
+                "SELECT eid, country, location FROM employees WHERE eid=$1",
                 body.eid,
             )
             if not emp:
@@ -156,7 +169,7 @@ async def create(body: PPACreate, created_by: str, request_id: str) -> dict:
                 body.hours, body.reason or None, created_by or None,
             )
 
-            country = emp["country"] or "AR"
+            country = to_iso(emp["country"], emp["location"])
             await _apply_ppa_to_daily_hours(
                 conn,
                 eid=body.eid,
