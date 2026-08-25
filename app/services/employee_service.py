@@ -1,4 +1,4 @@
-import time
+﻿import time
 from loguru import logger
 import app.db as db
 from app.config import settings
@@ -85,6 +85,7 @@ async def list_employees(
                 COALESCE(pl.name, e.people_lead::text) AS "Manager",
                 fu.te_approver AS "TEApprover",
                 fu.offering AS "ProjectType",
+                e.offering AS "EmployeeOffering",
                 fu.client AS "Client",
                 COALESCE(am.name, fu.account_manager::text) AS "AccountManager",
                 fu.office AS "Office",
@@ -139,7 +140,6 @@ async def list_employees(
             )
             fp_map = {r["eid"]: r for r in fp_rows}
 
-            # ScenarioType: current period's block — drives Gantt bar style (solid vs dashed).
             block_rows = await conn.fetch(
                 """SELECT DISTINCT ON (eid) eid, scenario_type
                    FROM chargeability_blocks
@@ -149,7 +149,6 @@ async def list_employees(
             )
             scenario_map = {r["eid"]: r["scenario_type"] for r in block_rows}
 
-            # HasAssumptionBlocks: any assumption block in current or future periods.
             assumption_rows = await conn.fetch(
                 """SELECT DISTINCT cb.eid
                    FROM chargeability_blocks cb
@@ -174,27 +173,28 @@ async def list_employees(
         chg_pct_sl_val       = float(fp["chg_pct_sl"] or 0)      if fp else 0.0
         chg_pct_hl_val       = float(fp["chg_pct_hl"] or 0)      if fp else 0.0
         row.update({
-            "chg":             [chg_val],
-            "sah":             [sah_val],
-            "cp":              [chg_pct_hl_val],
-            "chg_hl":          [chg_hl_val],
-            "chg_sl":          [chg_sl_val],
-            "chg_cascadeadas": [chg_cascadeadas_val],
-            "absence_hours":   [absence_hours_val],
-            "chg_pct_sl":      [chg_pct_sl_val],
-            "chg_pct_hl":      [chg_pct_hl_val],
-            "ScenarioType":        scenario_map.get(row["EID"], "effective"),
-            "HasAssumptionBlocks": row["EID"] in assumption_eids,
+            "chg":              [chg_val],
+            "sah":              [sah_val],
+            "cp":               [chg_pct_hl_val],
+            "chg_hl":           [chg_hl_val],
+            "chg_sl":           [chg_sl_val],
+            "chg_cascadeadas":  [chg_cascadeadas_val],
+            "absence_hours":    [absence_hours_val],
+            "chg_pct_sl":       [chg_pct_sl_val],
+            "chg_pct_hl":       [chg_pct_hl_val],
+            "ScenarioType":         scenario_map.get(row["EID"], "effective"),
+            "HasAssumptionBlocks":  row["EID"] in assumption_eids,
             "NJFormat": (
                 f"{row['Name']} | {row['HireDate']} | CL{row['CL']} | {row['Country']}"
                 if row.get("NewJoiner") else None
             ),
-            "FTE": float(row.get("FTE") or 1),
+            "FTE":              float(row.get("FTE") or 1),
             "ChargeabilityPct": float(row.get("ChargeabilityPct") or 0),
-            "DaysToAvailable": float(row.get("DaysToAvailable") or 0),
-            "NextPTOHours": float(row.get("NextPTOHours") or 0),
-            "Charge": row.get("Charge") is not False,
-            "Ringfenced": bool(row.get("Ringfenced") or False),
+            "DaysToAvailable":  float(row.get("DaysToAvailable") or 0),
+            "NextPTOHours":     float(row.get("NextPTOHours") or 0),
+            "Charge":           row.get("Charge") is not False,
+            "Ringfenced":       bool(row.get("Ringfenced") or False),
+            "EmployeeOffering": row.get("EmployeeOffering"),
         })
         employees.append(row)
 
@@ -241,17 +241,19 @@ async def update(eid: str, body: EmployeeUpdate, request_id: str) -> dict:
                 if taken:
                     raise ForecastException(AppError.EMPLOYEE_EID_TAKEN)
 
-            if body.new_eid or body.name or body.cl is not None or body.ringfenced is not None:
+            if body.new_eid or body.name or body.cl is not None or body.ringfenced is not None or body.employee_offering is not None:
                 await conn.execute(
                     """
                     UPDATE employees SET
                         eid        = COALESCE($1, eid),
                         name       = COALESCE($2, name),
                         cl         = COALESCE($3, cl),
-                        ringfenced = COALESCE($5, ringfenced)
+                        ringfenced = COALESCE($5, ringfenced),
+                        offering   = COALESCE($6, offering)
                     WHERE eid = $4
                     """,
-                    body.new_eid or None, body.name or None, body.cl, eid, body.ringfenced,
+                    body.new_eid or None, body.name or None, body.cl, eid,
+                    body.ringfenced, body.employee_offering or None,
                 )
                 if body.new_eid and body.new_eid != eid:
                     await conn.execute("UPDATE forecast_update SET eid=$1 WHERE eid=$2", body.new_eid, eid)
@@ -321,6 +323,7 @@ async def get_employee(eid: str) -> dict:
                 COALESCE(pl.name, e.people_lead::text) AS "Manager",
                 fu.te_approver AS "TEApprover",
                 fu.offering AS "ProjectType",
+                e.offering AS "EmployeeOffering",
                 fu.client AS "Client",
                 COALESCE(am.name, fu.account_manager::text) AS "AccountManager",
                 fu.office AS "Office",
@@ -375,25 +378,26 @@ async def get_employee(eid: str) -> dict:
     chg_pct_sl_val       = float(fp["chg_pct_sl"] or 0)      if fp else 0.0
     chg_pct_hl_val       = float(fp["chg_pct_hl"] or 0)      if fp else 0.0
     result.update({
-        "chg":             [chg_val],
-        "sah":             [sah_val],
-        "cp":              [chg_pct_hl_val],
-        "chg_hl":          [chg_hl_val],
-        "chg_sl":          [chg_sl_val],
-        "chg_cascadeadas": [chg_cascadeadas_val],
-        "absence_hours":   [absence_hours_val],
-        "chg_pct_sl":      [chg_pct_sl_val],
-        "chg_pct_hl":      [chg_pct_hl_val],
+        "chg":              [chg_val],
+        "sah":              [sah_val],
+        "cp":               [chg_pct_hl_val],
+        "chg_hl":           [chg_hl_val],
+        "chg_sl":           [chg_sl_val],
+        "chg_cascadeadas":  [chg_cascadeadas_val],
+        "absence_hours":    [absence_hours_val],
+        "chg_pct_sl":       [chg_pct_sl_val],
+        "chg_pct_hl":       [chg_pct_hl_val],
         "NJFormat": (
             f"{result['Name']} | {result['HireDate']} | CL{result['CL']} | {result['Country']}"
             if result.get("NewJoiner") else None
         ),
-        "FTE": float(result.get("FTE") or 1),
+        "FTE":              float(result.get("FTE") or 1),
         "ChargeabilityPct": float(result.get("ChargeabilityPct") or 0),
-        "DaysToAvailable": float(result.get("DaysToAvailable") or 0),
-        "NextPTOHours": float(result.get("NextPTOHours") or 0),
-        "Charge": result.get("Charge") is not False,
-        "Ringfenced": bool(result.get("Ringfenced") or False),
+        "DaysToAvailable":  float(result.get("DaysToAvailable") or 0),
+        "NextPTOHours":     float(result.get("NextPTOHours") or 0),
+        "Charge":           result.get("Charge") is not False,
+        "Ringfenced":       bool(result.get("Ringfenced") or False),
+        "EmployeeOffering": result.get("EmployeeOffering"),
     })
     return result
 
@@ -412,14 +416,12 @@ async def assign_real_eid(old_eid: str, new_eid: str, new_name: str | None, requ
                 if existing and not existing["new_joiner"]:
                     raise ForecastException(AppError.EMPLOYEE_EID_TAKEN)
 
-                # INSERT new row first so FK references (forecast_update → employees) stay valid
-                # during the transition. Then update child tables, then remove old row.
                 await conn.execute(
                     """
                     INSERT INTO employees (eid, name, country, location, cl, fte, active,
-                        hire_date, termination_date, people_lead, new_joiner, charge, ringfenced)
+                        hire_date, termination_date, people_lead, new_joiner, charge, ringfenced, offering)
                     SELECT $1, COALESCE($2, name), country, location, cl, fte, active,
-                        hire_date, termination_date, people_lead, FALSE, charge, ringfenced
+                        hire_date, termination_date, people_lead, FALSE, charge, ringfenced, offering
                     FROM employees WHERE eid=$3
                     """,
                     new_eid, new_name or None, old_eid,
