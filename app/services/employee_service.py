@@ -85,6 +85,7 @@ async def list_employees(
                 COALESCE(pl.name, e.people_lead::text) AS "Manager",
                 fu.te_approver AS "TEApprover",
                 fu.offering AS "ProjectType",
+                fu.isg_aligned AS "ISGAligned",
                 e.offering AS "EmployeeOffering",
                 fu.client AS "Client",
                 COALESCE(am.name, fu.account_manager::text) AS "AccountManager",
@@ -195,6 +196,7 @@ async def list_employees(
             "Charge":           row.get("Charge") is not False,
             "Ringfenced":       bool(row.get("Ringfenced") or False),
             "EmployeeOffering": row.get("EmployeeOffering"),
+            "ISGAligned":       bool(row.get("ISGAligned") or False),
         })
         employees.append(row)
 
@@ -323,6 +325,7 @@ async def get_employee(eid: str) -> dict:
                 COALESCE(pl.name, e.people_lead::text) AS "Manager",
                 fu.te_approver AS "TEApprover",
                 fu.offering AS "ProjectType",
+                fu.isg_aligned AS "ISGAligned",
                 e.offering AS "EmployeeOffering",
                 fu.client AS "Client",
                 COALESCE(am.name, fu.account_manager::text) AS "AccountManager",
@@ -398,6 +401,7 @@ async def get_employee(eid: str) -> dict:
         "Charge":           result.get("Charge") is not False,
         "Ringfenced":       bool(result.get("Ringfenced") or False),
         "EmployeeOffering": result.get("EmployeeOffering"),
+        "ISGAligned":       bool(result.get("ISGAligned") or False),
     })
     return result
 
