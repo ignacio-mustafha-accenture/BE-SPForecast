@@ -13,3 +13,6 @@ __pycache__/
 railway.toml
 Procfile
 *.sql
+!schema_auth.sql
+!schema_clients.sql
+!schema_holidays.sql
