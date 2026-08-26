@@ -1,4 +1,4 @@
-from typing import Optional
+﻿from typing import Optional
 from pydantic import BaseModel
 
 
@@ -10,6 +10,10 @@ class PPACreate(BaseModel):
     reason: Optional[str] = None
 
 
+class PPAReject(BaseModel):
+    reason: str
+
+
 class PPAOut(BaseModel):
     id: str
     eid: str
@@ -18,4 +22,6 @@ class PPAOut(BaseModel):
     to_period: str
     hours: int
     reason: Optional[str]
+    status: str
+    rejection_reason: Optional[str]
     date: Optional[str]
