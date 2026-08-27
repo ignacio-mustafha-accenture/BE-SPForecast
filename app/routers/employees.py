@@ -10,6 +10,7 @@ router = APIRouter()
 async def list_employees(
     request: Request,
     country: str | None = Query(None),
+    cl: str | None = Query(None),
     q: str | None = Query(None),
     status: str | None = Query(None),
     page: int = Query(1, ge=1),
@@ -20,10 +21,9 @@ async def list_employees(
 ):
     request.state.action = "List employees"
     return await employee_service.list_employees(
-        country, q, status, page, page_size,
+        country, cl, q, status, page, page_size,
         offering=offering, te_approver=te_approver, chg_bucket=chg_bucket,
     )
-
 
 @router.get("/on-pto", dependencies=[require_permission("state:read")])
 async def employees_on_pto(request: Request):

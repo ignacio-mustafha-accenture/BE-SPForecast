@@ -9,7 +9,6 @@ import app.services.recalculate_service as recalculate_service
 
 async def list_employees(
     country: str | None,
-    cl: str | None,
     q: str | None,
     status: str | None,
     page: int,
@@ -46,13 +45,6 @@ async def list_employees(
         conditions.append("fu.chargeability_pct >= 50 AND fu.chargeability_pct < 80")
     elif status == "red":
         conditions.append("fu.chargeability_pct < 50 AND COALESCE(e.charge, TRUE) = TRUE")
-
-    # Pendiente 7.2: acepta varios niveles separados por coma (ej: 9,10,11)
-    if cl:
-        niveles = [int(x) for x in cl.split(',') if x.strip().isdigit()]
-        if niveles:
-            params.append(niveles)
-            conditions.append(f"CAST(e.cl AS INTEGER) = ANY(${len(params)})")
 
     if offering:
         params.append(offering)
