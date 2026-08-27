@@ -1,8 +1,11 @@
 import time
+import calendar as pycalendar
 from datetime import date
 from loguru import logger
 import app.db as db
 from app.config import settings
+
+DEFAULT_TARGET_PCT = 87
 
 
 async def _timed_fetch(conn, query: str, *args, request_id: str = "-"):
@@ -32,14 +35,14 @@ def _fallback_periods(window_offset: int) -> list:
     for i in range(6):
         py, pm, ph = add(y, m, h, window_offset + i)
         s = 1 if ph == 0 else 16
-        import calendar
-        e = 15 if ph == 0 else calendar.monthrange(py, pm + 1)[1]
+        e = 15 if ph == 0 else pycalendar.monthrange(py, pm + 1)[1]
         pn = f"{MN[pm]}-P{ph+1}"
         result.append({
             "id": f"P{i+1}",
             "period_name": pn,
             "label": pn,
             "sah": 80,
+            "sah_by_country": {},
             "isCurrent": window_offset == 0 and i == 0,
             "start_date": date(py, pm + 1, s).isoformat(),
             "end_date": date(py, pm + 1, e).isoformat(),
@@ -49,7 +52,6 @@ def _fallback_periods(window_offset: int) -> list:
 
 async def get_state(window_offset: int = 0) -> dict:
     async with db.pool.acquire() as conn:
-        # --- Periods ---
         try:
             period_rows = await conn.fetch("""
                 SELECT p.period_name, p.start_date, p.end_date,
@@ -61,7 +63,6 @@ async def get_state(window_offset: int = 0) -> dict:
                 ORDER BY p.start_date
             """)
             today = date.today()
-            # Deduplicate by start_date, preferring Spanish month names ("Ago" < "Aug")
             seen_starts: dict = {}
             for r in sorted(period_rows, key=lambda r: (r["start_date"], r["period_name"])):
                 if r["start_date"] not in seen_starts:
@@ -92,13 +93,31 @@ async def get_state(window_offset: int = 0) -> dict:
 
         period_names = [p["period_name"] for p in periods]
 
-        # --- Active PTOs (today ∈ [start_date, end_date]) ---
+
+        sah_rows = await conn.fetch(
+            """
+            SELECT p.period_name,
+                   c.country,
+                   COUNT(*) FILTER (WHERE c.is_working_day) * 8 AS sah
+            FROM calendar c
+            JOIN periods p ON c.date BETWEEN p.start_date AND p.end_date
+            WHERE p.period_name = ANY($1)
+            GROUP BY p.period_name, c.country
+            """,
+            period_names,
+        )
+        sah_by_period: dict = {}
+        for r in sah_rows:
+            sah_by_period.setdefault(r["period_name"], {})[r["country"]] = float(r["sah"] or 0)
+        for p in periods:
+            p["sah_by_country"] = sah_by_period.get(p["period_name"], {})
+
         pto_rows = await conn.fetch(
             "SELECT eid FROM absences WHERE type='PTO' AND start_date <= CURRENT_DATE AND end_date >= CURRENT_DATE"
         )
         active_pto_eids = {r["eid"] for r in pto_rows}
 
-        # --- Employees ---
+
         emp_rows = await conn.fetch("""
             WITH latest_fu AS (
                 SELECT DISTINCT ON (eid) * FROM forecast_update ORDER BY eid, updated_at DESC NULLS LAST
@@ -121,7 +140,11 @@ async def get_state(window_offset: int = 0) -> dict:
                 TO_CHAR(fu.roll_on,'DD/MM/YY') AS "RollOn",
                 TO_CHAR(fu.roll_off,'DD/MM/YY') AS "RollOff",
                 TO_CHAR(fu.first_available,'DD/MM/YY') AS "FAD",
-                fu.days_available AS "DaysToAvailable",
+                CASE
+                    WHEN fu.roll_off IS NULL THEN NULL
+                    WHEN fu.roll_off <= CURRENT_DATE THEN 0
+                    ELSE (fu.roll_off - CURRENT_DATE)
+                END AS "DaysToAvailable",
                 fu.chargeability_pct AS "ChargeabilityPct",
                 TO_CHAR(fu.next_pto,'DD/MM/YY') AS "NextPTO",
                 TO_CHAR(fu.next_pto_end,'DD/MM/YY') AS "NextPTOEnd",
@@ -141,9 +164,10 @@ async def get_state(window_offset: int = 0) -> dict:
             ORDER BY COALESCE(e.country, e.location), e.name
         """)
 
-        # --- Forecast map desde employee_daily_hours (calculo dia a dia) ---
-        # CHG% HL = (chg_hl + chg_ppa) / sah * 100
-        # CHG% SL = (chg_hl + chg_sl + chg_ppa) / sah * 100
+        # Forecast map desde employee_daily_hours (calculo dia a dia)
+        # CHG% HL  = (chg_hl + chg_ppa) / sah * 100
+        # CHG% SL  = (chg_hl + chg_sl + chg_ppa) / sah * 100
+        # CHG Neto = chg_hl + chg_sl
         fp_rows = await conn.fetch(
             """
             SELECT
@@ -153,7 +177,8 @@ async def get_state(window_offset: int = 0) -> dict:
                 SUM(edh.chg_hl)                                                     AS chg_hl,
                 SUM(edh.chg_sl)                                                     AS chg_sl,
                 SUM(edh.chg_ppa)                                                    AS chg_cascadeadas,
-                SUM(edh.chg_hl + edh.chg_sl + edh.chg_ppa)                         AS chg,
+                SUM(edh.chg_hl + edh.chg_sl)                                        AS chg_neto,
+                SUM(edh.chg_hl + edh.chg_sl + edh.chg_ppa)                          AS chg,
                 0                                                                   AS absence_hours,
                 CASE WHEN SUM(edh.sah) > 0
                      THEN ROUND(SUM(edh.chg_hl + edh.chg_ppa) / SUM(edh.sah) * 100, 2)
@@ -175,6 +200,7 @@ async def get_state(window_offset: int = 0) -> dict:
                 forecast_map[fp["eid"]] = {}
             forecast_map[fp["eid"]][fp["period_name"]] = {
                 "chg":             float(fp["chg"] or 0),
+                "chg_neto":        float(fp["chg_neto"] or 0),
                 "sah":             float(fp["sah"] or 0),
                 "chg_hl":          float(fp["chg_hl"] or 0),
                 "chg_sl":          float(fp["chg_sl"] or 0),
@@ -189,6 +215,7 @@ async def get_state(window_offset: int = 0) -> dict:
             row = dict(e)
             fp = forecast_map.get(row["EID"], {})
             chg_arr             = [float(fp.get(pn, {}).get("chg", 0))             for pn in period_names]
+            chg_neto_arr        = [float(fp.get(pn, {}).get("chg_neto", 0))        for pn in period_names]
             sah_arr             = [float(fp.get(pn, {}).get("sah", 0))             for pn in period_names]
             chg_hl_arr          = [float(fp.get(pn, {}).get("chg_hl", 0))          for pn in period_names]
             chg_sl_arr          = [float(fp.get(pn, {}).get("chg_sl", 0))          for pn in period_names]
@@ -198,13 +225,23 @@ async def get_state(window_offset: int = 0) -> dict:
             chg_pct_hl_arr      = [float(fp.get(pn, {}).get("chg_pct_hl", 0))      for pn in period_names]
 
             cur_fp = fp.get(period_names[0], {}) if period_names else {}
-            is_assumption = (
-                float(cur_fp.get("chg_sl", 0)) > 0
-                and float(cur_fp.get("chg_hl", 0)) == 0
-            )
+            client = row.get("Client") or ""
+            no_client = not client or client.strip().lower() in ("unassigned", "")
+            if row.get("NewJoiner"):
+                scenario = "newJoiner"
+            elif client == "ISG PE Assessment":
+                scenario = "isgAssessment"
+            elif row.get("Ringfenced") and row.get("ISGAligned"):
+                scenario = "isgRingfenced"
+            elif no_client:
+                scenario = "noIsg"
+            else:
+                scenario = "effective"
+
             row.update({
-                "ScenarioType":    "assumption" if is_assumption else "effective",
+                "ScenarioType": scenario,
                 "chg":             chg_arr,
+                "chg_neto":        chg_neto_arr,
                 "sah":             sah_arr,
                 "cp":              chg_pct_hl_arr,
                 "chg_hl":          chg_hl_arr,
@@ -219,7 +256,10 @@ async def get_state(window_offset: int = 0) -> dict:
                 ),
                 "FTE": float(row.get("FTE") or 1),
                 "ChargeabilityPct": float(row.get("ChargeabilityPct") or 0),
-                "DaysToAvailable": float(row.get("DaysToAvailable") or 0),
+                "DaysToAvailable": (
+                    float(row["DaysToAvailable"])
+                    if row.get("DaysToAvailable") is not None else None
+                ),
                 "NextPTOHours": float(row.get("NextPTOHours") or 0),
                 "Charge": row.get("Charge") is not False,
                 "IsOnPTO": row["EID"] in active_pto_eids,
@@ -227,15 +267,13 @@ async def get_state(window_offset: int = 0) -> dict:
             })
             employees.append(row)
 
-        # --- Targets ---
         target_rows = await conn.fetch(
             "SELECT country, target_pct FROM targets WHERE fiscal_year='FY26' AND (valid_to IS NULL OR valid_to>=CURRENT_DATE)"
         )
-        targets = {"general": 87}
+        targets = {"general": DEFAULT_TARGET_PCT}
         for t in target_rows:
             targets[t["country"]] = float(t["target_pct"])
 
-        # --- Tickets ---
         ticket_rows = await conn.fetch("""
             SELECT t.id::text AS id, t.type, t.eid, t.detail, t.status,
                    TO_CHAR(t.date,'DD/MM/YY') AS date,
@@ -258,7 +296,6 @@ async def get_state(window_offset: int = 0) -> dict:
         """)
         tickets = [dict(r) for r in ticket_rows]
 
-        # --- PPA log ---
         ppa_rows = await conn.fetch("""
             SELECT p.id::text AS id, p.eid, e.name,
                    p.from_period AS "from", p.to_period AS "to",
