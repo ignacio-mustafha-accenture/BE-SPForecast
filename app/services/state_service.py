@@ -184,7 +184,7 @@ async def get_state(window_offset: int = 0) -> dict:
                      THEN ROUND(SUM(edh.chg_hl + edh.chg_ppa) / SUM(edh.sah) * 100, 2)
                      ELSE 0 END                                                     AS chg_pct_hl,
                 CASE WHEN SUM(edh.sah) > 0
-                     THEN ROUND(SUM(edh.chg_hl + edh.chg_sl + edh.chg_ppa) / SUM(edh.sah) * 100, 2)
+                     THEN ROUND(SUM(edh.chg_sl) / SUM(edh.sah) * 100, 2)
                      ELSE 0 END                                                     AS chg_pct_sl
             FROM employee_daily_hours edh
             JOIN periods p ON edh.date BETWEEN p.start_date AND p.end_date
