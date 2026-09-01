@@ -8,3 +8,4 @@ bcrypt
 python-jose[cryptography]
 fastapi-mail
 loguru
+openpyxl>=3.1
