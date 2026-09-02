@@ -68,7 +68,7 @@ async def main(force: bool = False, dry_run: bool = False):
     # 3. Forecast periods con datos reales
     print("\nCargando forecast_periods...")
     fp_rows = await conn.fetch("""
-        SELECT fp.eid, fp.period_name, fp.chg_hl, fp.chg_sl, fp.chg_cascadeadas
+        SELECT fp.eid, fp.period_name, fp.sah, fp.chg_hl, fp.chg_sl, fp.chg_cascadeadas
         FROM forecast_periods fp
         JOIN employees e ON fp.eid = e.eid
         WHERE fp.chg_hl != 0 OR fp.chg_sl != 0 OR fp.sah != 0
@@ -105,12 +105,16 @@ async def main(force: bool = False, dry_run: bool = False):
         chg_hl_day  = (fp["chg_hl"]          or Decimal(0)) / n
         chg_sl_day  = (fp["chg_sl"]          or Decimal(0)) / n
         chg_ppa_day = (fp["chg_cascadeadas"] or Decimal(0)) / n
+        # El SAH se reparte igual que el CHG en vez de asumir 8h por dia habil.
+        # Con 8 fijo, SUM(sah) daba los dias habiles del calendario, que no
+        # coinciden con el Excel: 88h donde el Excel dice 96h.
+        sah_day = (fp["sah"] or Decimal(0)) / n
 
         for day in days:
             rows_to_insert.append((
                 eid,
                 day,
-                Decimal("8.00"),
+                sah_day,
                 chg_hl_day,
                 chg_sl_day,
                 chg_ppa_day,

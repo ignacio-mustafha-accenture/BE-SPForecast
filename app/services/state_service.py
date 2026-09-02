@@ -94,15 +94,27 @@ async def get_state(window_offset: int = 0) -> dict:
         period_names = [p["period_name"] for p in periods]
 
 
+        # El SAH sale del Excel via forecast_periods, no de contar dias habiles
+        # del calendario: los feriados de esa tabla no coinciden con el Excel y
+        # el header terminaba mostrando quincenas de 88h donde el Excel dice 96.
+        # Por pais se toma el SAH mas frecuente, que es el del empleado full time.
         sah_rows = await conn.fetch(
             """
-            SELECT p.period_name,
-                   c.country,
-                   COUNT(*) FILTER (WHERE c.is_working_day) * 8 AS sah
-            FROM calendar c
-            JOIN periods p ON c.date BETWEEN p.start_date AND p.end_date
-            WHERE p.period_name = ANY($1)
-            GROUP BY p.period_name, c.country
+            SELECT period_name, country, sah
+            FROM (
+                SELECT fp.period_name,
+                       e.country,
+                       fp.sah,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY fp.period_name, e.country
+                           ORDER BY COUNT(*) DESC, fp.sah DESC
+                       ) AS rn
+                FROM forecast_periods fp
+                JOIN employees e ON e.eid = fp.eid AND e.active
+                WHERE fp.period_name = ANY($1) AND fp.sah > 0
+                GROUP BY fp.period_name, e.country, fp.sah
+            ) ranked
+            WHERE rn = 1
             """,
             period_names,
         )
@@ -110,7 +122,10 @@ async def get_state(window_offset: int = 0) -> dict:
         for r in sah_rows:
             sah_by_period.setdefault(r["period_name"], {})[r["country"]] = float(r["sah"] or 0)
         for p in periods:
-            p["sah_by_country"] = sah_by_period.get(p["period_name"], {})
+            by_country = sah_by_period.get(p["period_name"], {})
+            p["sah_by_country"] = by_country
+            if by_country:
+                p["sah"] = by_country.get("Argentina") or max(by_country.values())
 
         pto_rows = await conn.fetch(
             "SELECT eid FROM absences WHERE type='PTO' AND start_date <= CURRENT_DATE AND end_date >= CURRENT_DATE"
@@ -154,7 +169,8 @@ async def get_state(window_offset: int = 0) -> dict:
                 e.new_joiner AS "NewJoiner",
                 TO_CHAR(e.termination_date,'DD/MM/YY') AS "TerminationDate",
                 COALESCE(e.charge, TRUE) AS "Charge",
-                COALESCE(e.ringfenced, FALSE) AS "Ringfenced"
+                COALESCE(e.ringfenced, FALSE) AS "Ringfenced",
+                COALESCE(fu.isg_aligned = 'Yes', FALSE) AS "ISGAligned"
             FROM employees e
             LEFT JOIN latest_fu fu ON e.eid = fu.eid
             LEFT JOIN employees pl ON e.people_lead = pl.eid
@@ -193,6 +209,21 @@ async def get_state(window_offset: int = 0) -> dict:
             """,
             period_names,
         )
+        # Subtipo de assumption por (eid, periodo) para el color de la celda
+        kind_rows = await conn.fetch(
+            """
+            SELECT eid, period_name, assumption_kind
+            FROM chargeability_blocks
+            WHERE scenario_type = 'assumption'
+              AND assumption_kind IS NOT NULL
+              AND period_name = ANY($1)
+            """,
+            period_names,
+        )
+        kind_map: dict = {}
+        for k in kind_rows:
+            kind_map.setdefault(k["eid"], {})[k["period_name"]] = k["assumption_kind"]
+
 
         forecast_map: dict = {}
         for fp in fp_rows:
@@ -224,6 +255,9 @@ async def get_state(window_offset: int = 0) -> dict:
             chg_pct_sl_arr      = [float(fp.get(pn, {}).get("chg_pct_sl", 0))      for pn in period_names]
             chg_pct_hl_arr      = [float(fp.get(pn, {}).get("chg_pct_hl", 0))      for pn in period_names]
 
+            ak = kind_map.get(row["EID"], {})
+            assumption_kind_arr = [ak.get(pn) for pn in period_names]
+
             cur_fp = fp.get(period_names[0], {}) if period_names else {}
             client = row.get("Client") or ""
             no_client = not client or client.strip().lower() in ("unassigned", "")
@@ -250,6 +284,7 @@ async def get_state(window_offset: int = 0) -> dict:
                 "absence_hours":   absence_hours_arr,
                 "chg_pct_sl":      chg_pct_sl_arr,
                 "chg_pct_hl":      chg_pct_hl_arr,
+                "assumption_kind": assumption_kind_arr,
                 "NJFormat": (
                     f"{row['Name']} | {row['HireDate']} | CL{row['CL']} | {row['Country']}"
                     if row.get("NewJoiner") else None
@@ -264,6 +299,7 @@ async def get_state(window_offset: int = 0) -> dict:
                 "Charge": row.get("Charge") is not False,
                 "IsOnPTO": row["EID"] in active_pto_eids,
                 "Ringfenced": bool(row.get("Ringfenced") or False),
+                "ISGAligned": bool(row.get("ISGAligned") or False),
             })
             employees.append(row)
 
