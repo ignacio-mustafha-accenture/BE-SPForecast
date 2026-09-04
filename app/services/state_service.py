@@ -143,7 +143,7 @@ async def get_state(window_offset: int = 0) -> dict:
 
         # --- Forecast map desde employee_daily_hours (calculo dia a dia) ---
         # CHG% HL = (chg_hl + chg_ppa) / sah * 100
-        # CHG% SL = (chg_hl + chg_sl + chg_ppa) / sah * 100
+        # CHG% SL = chg_sl / sah * 100  (solo horas de supuesto, sin HL)
         fp_rows = await conn.fetch(
             """
             SELECT
@@ -154,12 +154,11 @@ async def get_state(window_offset: int = 0) -> dict:
                 SUM(edh.chg_sl)                                                     AS chg_sl,
                 SUM(edh.chg_ppa)                                                    AS chg_cascadeadas,
                 SUM(edh.chg_hl + edh.chg_sl + edh.chg_ppa)                         AS chg,
-                0                                                                   AS absence_hours,
                 CASE WHEN SUM(edh.sah) > 0
                      THEN ROUND(SUM(edh.chg_hl + edh.chg_ppa) / SUM(edh.sah) * 100, 2)
                      ELSE 0 END                                                     AS chg_pct_hl,
                 CASE WHEN SUM(edh.sah) > 0
-                     THEN ROUND(SUM(edh.chg_hl + edh.chg_sl + edh.chg_ppa) / SUM(edh.sah) * 100, 2)
+                     THEN ROUND(SUM(edh.chg_sl) / SUM(edh.sah) * 100, 2)
                      ELSE 0 END                                                     AS chg_pct_sl
             FROM employee_daily_hours edh
             JOIN periods p ON edh.date BETWEEN p.start_date AND p.end_date
@@ -169,17 +168,46 @@ async def get_state(window_offset: int = 0) -> dict:
             period_names,
         )
 
+        # --- Horas de ausencia (PTO/sick) por (eid, periodo) ---
+        # Cuenta los días hábiles del calendario que solapan con cada ausencia,
+        # recortando al rango del período. Misma lógica que ticket_service al aprobar PTO.
+        abs_rows = await conn.fetch(
+            """
+            SELECT
+                a.eid,
+                p.period_name,
+                COUNT(c.date) * 8 AS absence_hours
+            FROM absences a
+            JOIN periods p
+                ON a.start_date <= p.end_date AND a.end_date >= p.start_date
+            JOIN employees e ON e.eid = a.eid
+            JOIN calendar c
+                ON  c.country = COALESCE(e.country, e.location)
+                AND c.date BETWEEN GREATEST(a.start_date, p.start_date)
+                               AND LEAST(a.end_date, p.end_date)
+                AND c.is_working_day = TRUE
+            WHERE p.period_name = ANY($1)
+            GROUP BY a.eid, p.period_name
+            """,
+            period_names,
+        )
+        absence_map: dict = {}
+        for ab in abs_rows:
+            absence_map.setdefault(ab["eid"], {})[ab["period_name"]] = float(ab["absence_hours"] or 0)
+
         forecast_map: dict = {}
         for fp in fp_rows:
-            if fp["eid"] not in forecast_map:
-                forecast_map[fp["eid"]] = {}
-            forecast_map[fp["eid"]][fp["period_name"]] = {
+            eid = fp["eid"]
+            pn  = fp["period_name"]
+            if eid not in forecast_map:
+                forecast_map[eid] = {}
+            forecast_map[eid][pn] = {
                 "chg":             float(fp["chg"] or 0),
                 "sah":             float(fp["sah"] or 0),
                 "chg_hl":          float(fp["chg_hl"] or 0),
                 "chg_sl":          float(fp["chg_sl"] or 0),
                 "chg_cascadeadas": float(fp["chg_cascadeadas"] or 0),
-                "absence_hours":   float(fp["absence_hours"] or 0),
+                "absence_hours":   absence_map.get(eid, {}).get(pn, 0.0),
                 "chg_pct_sl":      float(fp["chg_pct_sl"] or 0),
                 "chg_pct_hl":      float(fp["chg_pct_hl"] or 0),
             }
