@@ -7,16 +7,24 @@ from app.models.employees import EmployeeUpdate
 import app.services.recalculate_service as recalculate_service
 
 
-async def list_employees(
+def build_employee_filters(
     country: str | None,
+    cl: str | None,
     q: str | None,
     status: str | None,
-    page: int,
-    page_size: int,
     offering: str | None = None,
     te_approver: str | None = None,
     chg_bucket: str | None = None,
-) -> dict:
+) -> tuple[list[str], list]:
+    """Arma las condiciones WHERE que comparten el listado de empleados y los totales.
+
+    Devuelve (conditions, params) con placeholders posicionales ($1, $2, ...) numerados
+    desde el principio de params. Los valores que vienen del request SIEMPRE viajan como
+    parametros de la query, nunca interpolados en el SQL.
+
+    La query que consuma estas condiciones tiene que exponer los alias 'e' (employees),
+    'fu' (ultimo forecast_update) y 'fp_cur' (forecast del periodo actual).
+    """
     conditions = ["e.active = TRUE"]
     params: list = []
 
@@ -46,6 +54,13 @@ async def list_employees(
     elif status == "red":
         conditions.append("fu.chargeability_pct < 50 AND COALESCE(e.charge, TRUE) = TRUE")
 
+    # Pendiente 7.2: acepta varios niveles separados por coma (ej: 9,10,11)
+    if cl:
+        niveles = [int(x) for x in cl.split(',') if x.strip().isdigit()]
+        if niveles:
+            params.append(niveles)
+            conditions.append(f"CAST(e.cl AS INTEGER) = ANY(${len(params)})")
+
     if offering:
         params.append(offering)
         conditions.append(f"fu.offering = ${len(params)}")
@@ -60,6 +75,25 @@ async def list_employees(
         conditions.append("fp_cur.chg_pct_hl = 100")
     elif chg_bucket == "under":
         conditions.append("fp_cur.chg_pct_hl < 100")
+
+    return conditions, params
+
+
+async def list_employees(
+    country: str | None,
+    cl: str | None,
+    q: str | None,
+    status: str | None,
+    page: int,
+    page_size: int,
+    offering: str | None = None,
+    te_approver: str | None = None,
+    chg_bucket: str | None = None,
+) -> dict:
+    conditions, params = build_employee_filters(
+        country, cl, q, status,
+        offering=offering, te_approver=te_approver, chg_bucket=chg_bucket,
+    )
 
     where = " AND ".join(conditions)
     offset = (page - 1) * page_size
