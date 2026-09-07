@@ -183,6 +183,7 @@ async def get_state(window_offset: int = 0) -> dict:
                 TO_CHAR(e.termination_date,'DD/MM/YY') AS "TerminationDate",
                 COALESCE(e.charge, TRUE) AS "Charge",
                 COALESCE(e.ringfenced, FALSE) AS "Ringfenced",
+                e.reserva_status AS "ReservaStatus",
                 COALESCE(fu.isg_aligned = 'Yes', FALSE) AS "ISGAligned"
             FROM employees e
             LEFT JOIN latest_fu fu ON e.eid = fu.eid

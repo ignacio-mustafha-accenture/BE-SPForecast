@@ -68,6 +68,7 @@ LG_FIRST_DATA_ROW = 11
 LG_COL_LOCATION = 1
 LG_COL_EID = 2
 LG_COL_OFFERING = 3
+LG_COL_STATUS = 6
 
 # El bloque vigente se corre a la derecha cada mes. Los labels se repiten entre
 # el bloque viejo y el nuevo, asi que hay que decirle desde donde leer. Se
@@ -254,6 +255,8 @@ def parse_legacy(path: str, min_period_col: int):
         loc = loc.strip().upper() if isinstance(loc, str) else ''
         off = ws.cell(r, LG_COL_OFFERING).value
         off = off.strip() if isinstance(off, str) else ''
+        reserva = ws.cell(r, LG_COL_STATUS).value
+        reserva = reserva.strip() if isinstance(reserva, str) else None
 
         # El bloque de totales del Excel cuenta Location ARG/MX/CR con offering
         # SO/PR/Tools. El resto son filas de leyenda, placeholders 'DIGI' y
@@ -262,7 +265,7 @@ def parse_legacy(path: str, min_period_col: int):
             fuera_de_alcance[f'{loc or "(sin loc)"} / {off or "(sin offering)"}'] += 1
             continue
 
-        empleados[eid] = {'location': loc, 'offering': off, 'fuente': '9-1'}
+        empleados[eid] = {'location': loc, 'offering': off, 'reserva_status': reserva, 'fuente': '9-1'}
 
         for periodo, (ccol, scol, pcol) in period_tri.items():
             chg_cell = ws.cell(r, ccol)
@@ -381,7 +384,7 @@ def parse_digi(path: str):
             no_digi[sub or '(vacio)'] += 1
             continue
 
-        empleados[eid] = {'location': 'ARG', 'offering': sub, 'fuente': 'CONTROL'}
+        empleados[eid] = {'location': 'ARG', 'offering': sub, 'reserva_status': None, 'fuente': 'CONTROL'}
 
         for periodo, c in period_cols.items():
             hl = num(ws.cell(r, c['hl']).value) or 0.0
@@ -478,7 +481,7 @@ async def write_db(empleados, datos, periodos_por_fuente, dry_run, update_locati
                       for r in await conn.fetch(
                           'SELECT period_name, start_date, end_date FROM periods')}
         db_emp = {r['eid'].strip().lower(): r for r in await conn.fetch(
-            'SELECT eid, name, offering, location, country, active FROM employees')}
+            'SELECT eid, name, offering, location, country, active, reserva_status FROM employees')}
         log.info(f'DB: {len(db_periods)} periodos · {len(db_emp)} empleados')
 
         faltan_en_db = sorted(set(empleados) - set(db_emp))
@@ -492,8 +495,8 @@ async def write_db(empleados, datos, periodos_por_fuente, dry_run, update_locati
             log.warning(f'{len(sobran_en_db)} empleados activos en la DB que no estan '
                         f'en ninguna de las dos fuentes: {sobran_en_db}')
 
-        # --- offering y location
-        cambios_emp, cambios_fu, cambios_loc = [], [], []
+        # --- offering, location y reserva_status
+        cambios_emp, cambios_fu, cambios_loc, cambios_reserva = [], [], [], []
         fu_actual = {r['eid'].strip().lower(): r['offering'] for r in await conn.fetch(
             """
             SELECT DISTINCT ON (eid) eid, offering FROM forecast_update
@@ -512,6 +515,9 @@ async def write_db(empleados, datos, periodos_por_fuente, dry_run, update_locati
             if (row['location'] or '') != info['location'] or (row['country'] or '') != pais:
                 cambios_loc.append((eid, row['location'], row['country'],
                                     info['location'], pais))
+            nueva_reserva = info.get('reserva_status')
+            if (row['reserva_status'] or None) != (nueva_reserva or None):
+                cambios_reserva.append((eid, row['name'], row['reserva_status'], nueva_reserva))
 
         def tabla(titulo, filas, cols=4):
             if not filas:
@@ -532,6 +538,7 @@ async def write_db(empleados, datos, periodos_por_fuente, dry_run, update_locati
         tabla('employees.offering', cambios_emp)
         tabla('forecast_update.offering', cambios_fu)
         tabla('location / country', cambios_loc, cols=5)
+        tabla('reserva_status', cambios_reserva)
         if not update_location and cambios_loc:
             print('    (location/country NO se tocan sin --update-location)')
             print()
@@ -574,6 +581,11 @@ async def write_db(empleados, datos, periodos_por_fuente, dry_run, update_locati
                 await conn.executemany(
                     'UPDATE employees SET offering = $2 WHERE eid = $1',
                     [(e, n) for e, _nm, _a, n in cambios_emp])
+
+            if cambios_reserva:
+                await conn.executemany(
+                    'UPDATE employees SET reserva_status = $2 WHERE eid = $1',
+                    [(e, n) for e, _nm, _a, n in cambios_reserva])
 
             if cambios_fu:
                 # forecast_update puede tener varias filas por eid. Se actualizan
