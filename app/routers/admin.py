@@ -17,6 +17,7 @@ async def get_audit_log(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=50, ge=1, le=200),
     user_id: Optional[int] = None,
+    ticket_id: Optional[int] = None,
     action: Optional[str] = None,
     success: Optional[bool] = None,
     from_date: Optional[str] = None,
@@ -29,11 +30,17 @@ async def get_audit_log(
     params: list = []
 
     def add(cond, val):
-        params.append(val)
-        conditions.append(f"{cond}${len(params)}")
+     params.append(val)
+     conditions.append(f"{cond}${len(params)}")
 
     if user_id is not None:
         add("user_id=", user_id)
+    if ticket_id is not None:
+        params.append(f"/api/tickets/{ticket_id}/%")
+        idx_ep = len(params)
+        params.append(f"%ticket #{ticket_id}%")
+        idx_ac = len(params)
+        conditions.append(f"(endpoint LIKE ${idx_ep} OR action ILIKE ${idx_ac})")
     if action is not None:
         add("action=", action)
     if success is not None:
