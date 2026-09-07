@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Query, Request
 from app.dependencies import require_permission
 from app.models.employees import AssignEidBody, EmployeeUpdate
-from app.services import employee_service
+from app.services import employee_service, totals_service
 
 router = APIRouter()
 
@@ -29,6 +29,28 @@ async def list_employees(
 async def employees_on_pto(request: Request):
     request.state.action = "List employees on PTO"
     return await employee_service.get_employees_on_pto()
+
+
+# Se declara antes de /{eid} para que no lo capture el path param
+@router.get("/totals", dependencies=[require_permission("state:read")])
+async def employee_totals(
+    request: Request,
+    window_offset: int = Query(default=0),
+    country: str | None = Query(None),
+    cl: str | None = Query(None),
+    q: str | None = Query(None),
+    status: str | None = Query(None),
+    offering: str | None = Query(None),
+    te_approver: str | None = Query(None),
+    chg_bucket: str | None = Query(None),
+):
+    request.state.action = "Forecast totals"
+    return await totals_service.get_totals(
+        window_offset=window_offset,
+        country=country, cl=cl, q=q, status=status,
+        offering=offering, te_approver=te_approver, chg_bucket=chg_bucket,
+        request_id=request.state.request_id,
+    )
 
 
 @router.get("/{eid}", dependencies=[require_permission("state:read")])

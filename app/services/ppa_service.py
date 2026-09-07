@@ -47,6 +47,12 @@ async def _get_workdays(conn, period_name: str, country: str) -> list[date]:
 
 
 async def _apply_ppa_to_daily_hours(conn, eid, from_period, to_period, hours, country):
+    """Reparte el PPA dia a dia en employee_daily_hours.
+
+    Esta tabla ya NO alimenta la vista global (state_service y totals_service leen
+    forecast_periods). Se mantiene porque la granularidad diaria es lo que necesita la
+    vista Diaria; el impacto en los totales lo aplica _apply_ppa_to_forecast_periods.
+    """
     for period_name, sign in [(from_period, -1), (to_period, 1)]:
         workdays = await _get_workdays(conn, period_name, country)
         if not workdays:
@@ -64,6 +70,69 @@ async def _apply_ppa_to_daily_hours(conn, eid, from_period, to_period, hours, co
             [(eid, d, amount * sign) for d, amount in zip(workdays, amounts)],
         )
     logger.info("PPA applied to daily hours", eid=eid, from_period=from_period, to_period=to_period, hours=hours)
+
+
+# Acumula las horas del PPA en forecast_periods.chg_cascadeadas y rederiva las columnas
+# que dependen de ella, con las mismas formulas que usa la vista global:
+#   chg        = chg_hl + chg_sl + chg_cascadeadas
+#   chg_pct    = chg / sah * 100
+#   chg_pct_hl = (chg_hl + chg_cascadeadas) / sah * 100
+# chg_sl y chg_pct_sl no se tocan: el PPA no es soft lock.
+# El $3 es el delta con signo, y se suma dentro del mismo UPDATE para que el
+# read-modify-write quede serializado por el lock de fila de Postgres.
+_UPSERT_PPA_FP = """
+    INSERT INTO forecast_periods (
+        eid, period_name, chg, sah, chg_pct,
+        chg_hl, chg_sl, chg_cascadeadas, absence_hours, chg_pct_hl, chg_pct_sl
+    )
+    VALUES ($1, $2, $3, 0, 0, 0, 0, $3, 0, 0, 0)
+    ON CONFLICT (eid, period_name) DO UPDATE SET
+        chg_cascadeadas = COALESCE(forecast_periods.chg_cascadeadas, 0) + $3,
+        chg             = COALESCE(forecast_periods.chg_hl, 0)
+                        + COALESCE(forecast_periods.chg_sl, 0)
+                        + COALESCE(forecast_periods.chg_cascadeadas, 0) + $3,
+        chg_pct         = CASE WHEN COALESCE(forecast_periods.sah, 0) > 0
+                               THEN ROUND((COALESCE(forecast_periods.chg_hl, 0)
+                                         + COALESCE(forecast_periods.chg_sl, 0)
+                                         + COALESCE(forecast_periods.chg_cascadeadas, 0) + $3)
+                                          / forecast_periods.sah * 100, 2)
+                               ELSE 0 END,
+        chg_pct_hl      = CASE WHEN COALESCE(forecast_periods.sah, 0) > 0
+                               THEN ROUND((COALESCE(forecast_periods.chg_hl, 0)
+                                         + COALESCE(forecast_periods.chg_cascadeadas, 0) + $3)
+                                          / forecast_periods.sah * 100, 2)
+                               ELSE 0 END
+"""
+
+
+async def _apply_ppa_to_forecast_periods(conn, eid, from_period, to_period, hours):
+    """Impacta el PPA en forecast_periods, que es lo que lee la vista global.
+
+    Decision sobre from_period: se DESCUENTA del origen y se SUMA al destino. No es una
+    eleccion nueva, es la semantica que ya tenian los dos caminos que existian:
+    _apply_ppa_to_daily_hours reparte con signo -1 en from_period y +1 en to_period, y el
+    stored proc recalculate_forecast_period calcula su ajuste como
+    SUM(CASE WHEN to_period = p THEN hours WHEN from_period = p THEN -hours END).
+    Se replica tal cual para no cambiar la semantica de negocio: el PPA mueve horas, no
+    las crea, asi que el neto sobre el total del empleado es cero.
+
+    Ojo: si from_period y to_period son el mismo periodo los dos deltas se cancelan, que
+    es el resultado correcto. En ppa_log hay filas asi (por ejemplo Feb-P1 -> Feb-P1).
+    """
+    for period_name, sign in [(from_period, -1), (to_period, 1)]:
+        delta = Decimal(hours) * sign
+        result = await conn.execute(_UPSERT_PPA_FP, eid, period_name, delta)
+        # Si no se escribio ninguna fila el total del periodo quedaria sin el PPA y la
+        # aprobacion mentiria. Se corta la transaccion en vez de aprobar a medias.
+        if result and result.split()[-1] == "0":
+            raise ForecastException(
+                AppError.DB_ERROR,
+                f"No se pudo impactar el PPA en el periodo {period_name}",
+            )
+    logger.info(
+        "PPA applied to forecast_periods",
+        eid=eid, from_period=from_period, to_period=to_period, hours=hours,
+    )
 
 
 async def list_ppa(eid=None, from_period=None, status=None, page=1, page_size=25):
@@ -130,13 +199,18 @@ async def approve(ppa_id: str, approved_by: str, request_id: str) -> dict:
     logger.bind(action="ppa:approve", request_id=request_id).info("Approving PPA", ppa_id=ppa_id)
     start = time.monotonic()
     async with db.pool.acquire() as conn:
+        # Una sola transaccion para el impacto en forecast_periods, el reparto diario y el
+        # cambio de status: o se ve el PPA en los totales o el PPA sigue pendiente.
         async with conn.transaction():
+            # FOR UPDATE OF p toma el lock de la fila de ppa_log antes de leer el status,
+            # asi dos aprobaciones simultaneas del mismo PPA no lo aplican dos veces.
             ppa = await conn.fetchrow(
                 """
                 SELECT p.id, p.eid, p.from_period, p.to_period, p.hours, p.status,
                        COALESCE(e.country, e.location) AS country
                 FROM ppa_log p LEFT JOIN employees e ON p.eid = e.eid
                 WHERE p.id = $1
+                FOR UPDATE OF p
                 """,
                 int(ppa_id),
             )
@@ -145,6 +219,12 @@ async def approve(ppa_id: str, approved_by: str, request_id: str) -> dict:
             if ppa["status"] != "pending":
                 raise ForecastException(AppError.VALIDATION_ERROR, "El PPA no esta pendiente")
             country = to_iso(ppa["country"], ppa["country"])
+            # Primero forecast_periods, que es lo que alimenta la vista global
+            await _apply_ppa_to_forecast_periods(
+                conn, eid=ppa["eid"], from_period=ppa["from_period"],
+                to_period=ppa["to_period"], hours=ppa["hours"],
+            )
+            # Y despues el detalle diario, que solo consume la vista Diaria
             await _apply_ppa_to_daily_hours(
                 conn, eid=ppa["eid"], from_period=ppa["from_period"],
                 to_period=ppa["to_period"], hours=ppa["hours"], country=country,

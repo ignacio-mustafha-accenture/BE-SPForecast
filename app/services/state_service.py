@@ -50,46 +50,56 @@ def _fallback_periods(window_offset: int) -> list:
     return result
 
 
+async def resolve_period_window(conn, window_offset: int = 0) -> list:
+    """Devuelve la ventana de 6 periodos que se muestra en la UI para un window_offset.
+
+    Se usa desde get_state y desde totals_service para garantizar que los totales
+    agreguen exactamente los mismos periodos, y en el mismo orden, que las columnas
+    de la tabla.
+    """
+    try:
+        period_rows = await conn.fetch("""
+            SELECT p.period_name, p.start_date, p.end_date,
+                   SUM(CASE WHEN c.is_working_day AND c.country='Argentina' THEN 8 ELSE 0 END) AS sah
+            FROM periods p
+            LEFT JOIN calendar c ON c.period_name = p.period_name
+              AND EXTRACT(YEAR FROM c.date) IN (2025, 2026)
+            GROUP BY p.period_name, p.start_date, p.end_date
+            ORDER BY p.start_date
+        """)
+        today = date.today()
+        seen_starts: dict = {}
+        for r in sorted(period_rows, key=lambda r: (r["start_date"], r["period_name"])):
+            if r["start_date"] not in seen_starts:
+                seen_starts[r["start_date"]] = r
+        rows_list = sorted(seen_starts.values(), key=lambda r: r["start_date"])
+        cur = next(
+            (i for i, r in enumerate(rows_list)
+             if r["start_date"] <= today <= r["end_date"]),
+            0,
+        )
+        slice_start = max(0, cur + window_offset)
+        sliced = rows_list[slice_start: slice_start + 6]
+        return [
+            {
+                "id": f"P{i+1}",
+                "period_name": r["period_name"],
+                "label": r["period_name"],
+                "sah": float(r["sah"] or 80),
+                "isCurrent": window_offset == 0 and i == 0,
+                "start_date": r["start_date"].isoformat(),
+                "end_date": r["end_date"].isoformat(),
+            }
+            for i, r in enumerate(sliced)
+        ] or _fallback_periods(window_offset)
+    except Exception:
+        logger.exception("Failed to fetch periods, using fallback")
+        return _fallback_periods(window_offset)
+
+
 async def get_state(window_offset: int = 0) -> dict:
     async with db.pool.acquire() as conn:
-        try:
-            period_rows = await conn.fetch("""
-                SELECT p.period_name, p.start_date, p.end_date,
-                       SUM(CASE WHEN c.is_working_day AND c.country='Argentina' THEN 8 ELSE 0 END) AS sah
-                FROM periods p
-                LEFT JOIN calendar c ON c.period_name = p.period_name
-                  AND EXTRACT(YEAR FROM c.date) IN (2025, 2026)
-                GROUP BY p.period_name, p.start_date, p.end_date
-                ORDER BY p.start_date
-            """)
-            today = date.today()
-            seen_starts: dict = {}
-            for r in sorted(period_rows, key=lambda r: (r["start_date"], r["period_name"])):
-                if r["start_date"] not in seen_starts:
-                    seen_starts[r["start_date"]] = r
-            rows_list = sorted(seen_starts.values(), key=lambda r: r["start_date"])
-            cur = next(
-                (i for i, r in enumerate(rows_list)
-                 if r["start_date"] <= today <= r["end_date"]),
-                0,
-            )
-            slice_start = max(0, cur + window_offset)
-            sliced = rows_list[slice_start: slice_start + 6]
-            periods = [
-                {
-                    "id": f"P{i+1}",
-                    "period_name": r["period_name"],
-                    "label": r["period_name"],
-                    "sah": float(r["sah"] or 80),
-                    "isCurrent": window_offset == 0 and i == 0,
-                    "start_date": r["start_date"].isoformat(),
-                    "end_date": r["end_date"].isoformat(),
-                }
-                for i, r in enumerate(sliced)
-            ] or _fallback_periods(window_offset)
-        except Exception:
-            logger.exception("Failed to fetch periods, using fallback")
-            periods = _fallback_periods(window_offset)
+        periods = await resolve_period_window(conn, window_offset)
 
         period_names = [p["period_name"] for p in periods]
 
@@ -124,8 +134,11 @@ async def get_state(window_offset: int = 0) -> dict:
         for p in periods:
             by_country = sah_by_period.get(p["period_name"], {})
             p["sah_by_country"] = by_country
+            # employees.country guarda el codigo ('AR'), no el nombre. La tabla
+            # calendar usa 'Argentina', de ahi la confusion: buscar por nombre
+            # nunca acertaba y caia siempre al max().
             if by_country:
-                p["sah"] = by_country.get("Argentina") or max(by_country.values())
+                p["sah"] = by_country.get("AR") or max(by_country.values())
 
         pto_rows = await conn.fetch(
             "SELECT eid FROM absences WHERE type='PTO' AND start_date <= CURRENT_DATE AND end_date >= CURRENT_DATE"
@@ -180,32 +193,54 @@ async def get_state(window_offset: int = 0) -> dict:
             ORDER BY COALESCE(e.country, e.location), e.name
         """)
 
-        # Forecast map desde employee_daily_hours (calculo dia a dia)
-        # CHG% HL  = (chg_hl + chg_ppa) / sah * 100
-        # CHG% SL  = (chg_hl + chg_sl + chg_ppa) / sah * 100
-        # CHG Neto = chg_hl + chg_sl
+        # Forecast map desde forecast_periods, que es el total por (eid, periodo) y lo
+        # unico que se actualiza en cada recalculo, aprobacion de ticket, efectivizacion,
+        # alta/baja e import del Excel. Antes se agregaba employee_daily_hours, que solo
+        # se puebla con los scripts manuales de scripts/: la vista global quedaba
+        # mostrando datos viejos despues de cada operacion y, ademas, el ida y vuelta de
+        # repartir el total en dias y volver a sumarlo metia deriva de redondeo
+        # (sah 96 volvia como 96.03, chg 48 como 47.96).
+        #
+        # Semantica de cada metrica (se preserva la que ya exponia la vista global):
+        #   chg_hl          = horas hard lock
+        #   chg_sl          = horas soft lock
+        #   chg_cascadeadas = horas PPA
+        #   chg_neto        = chg_hl + chg_sl                    (SIN PPA)
+        #   chg             = chg_hl + chg_sl + chg_cascadeadas  (CON PPA)
+        #   CHG% HL         = (chg_hl + chg_cascadeadas) / sah * 100
+        #   CHG% SL         = chg_sl / sah * 100
+        #
+        # chg, chg_pct_hl y chg_pct_sl se derivan de las columnas de horas en vez de leer
+        # las columnas homonimas ya calculadas de forecast_periods. Motivo: una sola
+        # fuente de verdad. Las columnas guardadas las escriben tres caminos distintos
+        # (el stored proc recalculate_forecast_period, recalculate_service y
+        # chargeability_service) con definiciones que no coinciden entre si, y ninguno
+        # suma el PPA al porcentaje de HL. Derivando, el porcentaje siempre cierra contra
+        # las horas que se muestran al lado. Verificado contra dev: fp.chg ya coincide con
+        # chg_hl + chg_sl + chg_cascadeadas en las 3158 filas, y los porcentajes guardados
+        # solo difieren en 25 filas por el ROUND a entero de chg_hl/chg_sl (<= 0.56 pp).
         fp_rows = await conn.fetch(
             """
             SELECT
-                edh.eid,
-                p.period_name,
-                SUM(edh.sah)                                                        AS sah,
-                SUM(edh.chg_hl)                                                     AS chg_hl,
-                SUM(edh.chg_sl)                                                     AS chg_sl,
-                SUM(edh.chg_ppa)                                                    AS chg_cascadeadas,
-                SUM(edh.chg_hl + edh.chg_sl)                                        AS chg_neto,
-                SUM(edh.chg_hl + edh.chg_sl + edh.chg_ppa)                          AS chg,
-                0                                                                   AS absence_hours,
-                CASE WHEN SUM(edh.sah) > 0
-                     THEN ROUND(SUM(edh.chg_hl + edh.chg_ppa) / SUM(edh.sah) * 100, 2)
+                fp.eid,
+                fp.period_name,
+                COALESCE(fp.sah, 0)                                                 AS sah,
+                COALESCE(fp.chg_hl, 0)                                              AS chg_hl,
+                COALESCE(fp.chg_sl, 0)                                              AS chg_sl,
+                COALESCE(fp.chg_cascadeadas, 0)                                     AS chg_cascadeadas,
+                COALESCE(fp.chg_hl, 0) + COALESCE(fp.chg_sl, 0)                     AS chg_neto,
+                COALESCE(fp.chg_hl, 0) + COALESCE(fp.chg_sl, 0)
+                                       + COALESCE(fp.chg_cascadeadas, 0)            AS chg,
+                COALESCE(fp.absence_hours, 0)                                       AS absence_hours,
+                CASE WHEN COALESCE(fp.sah, 0) > 0
+                     THEN ROUND((COALESCE(fp.chg_hl, 0) + COALESCE(fp.chg_cascadeadas, 0))
+                                / fp.sah * 100, 2)
                      ELSE 0 END                                                     AS chg_pct_hl,
-                CASE WHEN SUM(edh.sah) > 0
-                     THEN ROUND(SUM(edh.chg_sl) / SUM(edh.sah) * 100, 2)
+                CASE WHEN COALESCE(fp.sah, 0) > 0
+                     THEN ROUND(COALESCE(fp.chg_sl, 0) / fp.sah * 100, 2)
                      ELSE 0 END                                                     AS chg_pct_sl
-            FROM employee_daily_hours edh
-            JOIN periods p ON edh.date BETWEEN p.start_date AND p.end_date
-            WHERE p.period_name = ANY($1)
-            GROUP BY edh.eid, p.period_name
+            FROM forecast_periods fp
+            WHERE fp.period_name = ANY($1)
             """,
             period_names,
         )
