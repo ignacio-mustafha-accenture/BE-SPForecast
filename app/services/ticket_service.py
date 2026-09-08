@@ -7,6 +7,7 @@ from app.config import settings
 from app.errors import AppError, ForecastException
 from app.models.tickets import TicketCreate, TicketUpdate, VALID_TICKET_TYPES
 from app.services.assumption_service import get_assumption_num, upsert_projection_blocks
+from app.services.daily_hours_service import recalculate_daily_hours_for_eid
 
 REQUIRED_FIELDS: dict = {
     "newproj": ["eid", "client_name", "offering_type", "chargeability_pct", "start_date", "end_date"],
@@ -553,7 +554,8 @@ async def approve_ticket(ticket_id: int, request_id: str) -> dict:
             ticket = await _fetch_full_ticket(conn, row["id"])
             await _apply_approval_side_effects(conn, ticket, request_id)
             if row["eid"]:
-                await _recalculate_all_periods_for_eid(conn, row["eid"], request_id)
+             await _recalculate_all_periods_for_eid(conn, row["eid"], request_id)
+             await recalculate_daily_hours_for_eid(conn, row["eid"], request_id)
             return ticket
         except ForecastException:
             raise
