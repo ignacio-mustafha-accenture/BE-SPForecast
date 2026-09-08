@@ -438,7 +438,11 @@ async def _apply_approval_side_effects(conn, ticket: dict, request_id: str):
                     """,
                     start_date_str, end_date_str,
                 )
+                start_date_obj = _d.fromisoformat(start_date_str)
+                end_date_obj = _d.fromisoformat(end_date_str)
                 for period in periods:
+                    block_start = max(start_date_obj, period["start_date"])
+                    block_end = min(end_date_obj, period["end_date"])
                     await conn.execute(
                         """
                         INSERT INTO chargeability_blocks
@@ -447,7 +451,7 @@ async def _apply_approval_side_effects(conn, ticket: dict, request_id: str):
                         VALUES ($1, $2, $3, 'effective', $4, $5, $4, 'system')
                         """,
                         eid, period["period_name"], chargeability_pct,
-                        period["start_date"], period["end_date"],
+                        block_start, block_end,
                     )
                 logger.bind(request_id=request_id).info(
                     "Effective chargeability blocks created",
