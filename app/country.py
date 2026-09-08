@@ -9,6 +9,12 @@ _ISO_BY_NAME = {
     "costa rica": "CR",
 }
 
+_FULL_NAME_BY_ISO = {
+    "AR": "Argentina",
+    "MX": "Mexico",
+    "CR": "Costa Rica",
+}
+
 
 def to_iso(*candidates: str | None, default: str = "AR") -> str:
     """
@@ -28,3 +34,9 @@ def to_iso(*candidates: str | None, default: str = "AR") -> str:
         if iso:
             return iso
     return default
+
+
+def to_calendar_name(*candidates: str | None, default: str = "Argentina") -> str:
+    """Convierte cualquier formato de país al nombre usado en la tabla calendar."""
+    iso = to_iso(*candidates, default=default)
+    return _FULL_NAME_BY_ISO.get(iso, default)

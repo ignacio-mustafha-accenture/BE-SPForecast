@@ -232,7 +232,6 @@ async def get_state(window_offset: int = 0) -> dict:
                 COALESCE(fp.chg_hl, 0) + COALESCE(fp.chg_sl, 0)                     AS chg_neto,
                 COALESCE(fp.chg_hl, 0) + COALESCE(fp.chg_sl, 0)
                                        + COALESCE(fp.chg_cascadeadas, 0)            AS chg,
-                COALESCE(fp.absence_hours, 0)                                       AS absence_hours,
                 CASE WHEN COALESCE(fp.sah, 0) > 0
                      THEN ROUND((COALESCE(fp.chg_hl, 0) + COALESCE(fp.chg_cascadeadas, 0))
                                 / fp.sah * 100, 2)
@@ -245,6 +244,37 @@ async def get_state(window_offset: int = 0) -> dict:
             """,
             period_names,
         )
+
+        # absence_hours en vivo: normaliza country para que 'AR' y 'Argentina' sean equivalentes,
+        # y recorta correctamente las ausencias que cruzan dos períodos.
+        abs_rows = await conn.fetch(
+            """
+            SELECT
+                a.eid,
+                p.period_name,
+                COUNT(c.date) * 8 AS absence_hours
+            FROM absences a
+            JOIN periods p
+                ON a.start_date <= p.end_date AND a.end_date >= p.start_date
+            JOIN employees e ON e.eid = a.eid
+            JOIN calendar c
+                ON  c.country = CASE
+                        WHEN UPPER(COALESCE(e.country, e.location)) IN ('AR','ARGENTINA') THEN 'Argentina'
+                        WHEN UPPER(COALESCE(e.country, e.location)) IN ('MX','MEXICO')    THEN 'Mexico'
+                        WHEN UPPER(COALESCE(e.country, e.location)) IN ('CR','COSTA RICA') THEN 'Costa Rica'
+                        ELSE COALESCE(e.country, e.location)
+                    END
+                AND c.date BETWEEN GREATEST(a.start_date, p.start_date)
+                               AND LEAST(a.end_date, p.end_date)
+                AND c.is_working_day = TRUE
+            WHERE p.period_name = ANY($1)
+            GROUP BY a.eid, p.period_name
+            """,
+            period_names,
+        )
+        absence_map: dict = {}
+        for ab in abs_rows:
+            absence_map.setdefault(ab["eid"], {})[ab["period_name"]] = float(ab["absence_hours"] or 0)
         # Subtipo de assumption por (eid, periodo) para el color de la celda
         kind_rows = await conn.fetch(
             """
@@ -263,16 +293,18 @@ async def get_state(window_offset: int = 0) -> dict:
 
         forecast_map: dict = {}
         for fp in fp_rows:
-            if fp["eid"] not in forecast_map:
-                forecast_map[fp["eid"]] = {}
-            forecast_map[fp["eid"]][fp["period_name"]] = {
+            eid = fp["eid"]
+            pn  = fp["period_name"]
+            if eid not in forecast_map:
+                forecast_map[eid] = {}
+            forecast_map[eid][pn] = {
                 "chg":             float(fp["chg"] or 0),
                 "chg_neto":        float(fp["chg_neto"] or 0),
                 "sah":             float(fp["sah"] or 0),
                 "chg_hl":          float(fp["chg_hl"] or 0),
                 "chg_sl":          float(fp["chg_sl"] or 0),
                 "chg_cascadeadas": float(fp["chg_cascadeadas"] or 0),
-                "absence_hours":   float(fp["absence_hours"] or 0),
+                "absence_hours":   absence_map.get(eid, {}).get(pn, 0.0),
                 "chg_pct_sl":      float(fp["chg_pct_sl"] or 0),
                 "chg_pct_hl":      float(fp["chg_pct_hl"] or 0),
             }

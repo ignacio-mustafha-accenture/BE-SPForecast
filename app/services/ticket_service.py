@@ -4,6 +4,7 @@ import asyncpg
 from loguru import logger
 import app.db as db
 from app.config import settings
+from app.country import to_calendar_name
 from app.errors import AppError, ForecastException
 from app.models.tickets import TicketCreate, TicketUpdate, VALID_TICKET_TYPES
 from app.services.assumption_service import get_assumption_num, upsert_projection_blocks
@@ -325,20 +326,26 @@ async def _apply_approval_side_effects(conn, ticket: dict, request_id: str):
         emp = await conn.fetchrow(
             "SELECT COALESCE(country, location) AS country FROM employees WHERE eid=$1", eid
         )
-        country = emp["country"] if emp else None
+        raw_country = emp["country"] if emp else None
+        calendar_country = to_calendar_name(raw_country) if raw_country else None
 
         absence_type = "SICK" if t_type == "sick" else "PTO"
 
-        if country:
+        if calendar_country:
             days_count = await conn.fetchval(
                 """
                 SELECT COUNT(*) FROM calendar
                 WHERE country=$1 AND date BETWEEN $2 AND $3 AND is_working_day=TRUE
                 """,
-                country, start_date, end_date,
+                calendar_country, start_date, end_date,
             )
         else:
-            days_count = (end_date - start_date).days + 1
+            # Fallback sin país: contar lunes-viernes del rango
+            from datetime import timedelta
+            days_count = sum(
+                1 for i in range((end_date - start_date).days + 1)
+                if (start_date + timedelta(days=i)).weekday() < 5
+            )
 
         await conn.execute(
             "DELETE FROM absences WHERE eid=$1 AND start_date=$2 AND end_date=$3 AND type=$4",
@@ -348,6 +355,34 @@ async def _apply_approval_side_effects(conn, ticket: dict, request_id: str):
             "INSERT INTO absences (eid, type, start_date, end_date, hours) VALUES ($1,$2,$3,$4,$5)",
             eid, absence_type, start_date, end_date, days_count * 8,
         )
+
+        # Sincronizar tabla diaria: SAH = 0 para días de ausencia
+        if calendar_country:
+            await conn.execute(
+                """
+                UPDATE employee_daily_hours edh
+                SET sah = 0, chg_hl = 0, chg_sl = 0, updated_at = NOW()
+                WHERE edh.eid = $1
+                  AND edh.date IN (
+                      SELECT c.date FROM calendar c
+                      WHERE c.country = $4
+                        AND c.date BETWEEN $2 AND $3
+                        AND c.is_working_day = TRUE
+                  )
+                """,
+                eid, start_date, end_date, calendar_country,
+            )
+        else:
+            await conn.execute(
+                """
+                UPDATE employee_daily_hours
+                SET sah = 0, chg_hl = 0, chg_sl = 0, updated_at = NOW()
+                WHERE eid = $1
+                  AND date BETWEEN $2 AND $3
+                  AND EXTRACT(DOW FROM date) BETWEEN 1 AND 5
+                """,
+                eid, start_date, end_date,
+            )
 
         logger.bind(request_id=request_id).info(
             "Absence inserted on ticket approval",
