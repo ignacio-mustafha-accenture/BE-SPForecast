@@ -184,13 +184,16 @@ async def create(body: PPACreate, created_by: str, request_id: str) -> dict:
                 period = await conn.fetchrow("SELECT period_name FROM periods WHERE period_name=$1", period_name)
                 if not period:
                     raise ForecastException(AppError.PERIOD_NOT_FOUND, f"Periodo {period_name} no encontrado")
+            total_hours = (body.hours_chargeable or 0) + (body.hours_standard or 0)
             row = await conn.fetchrow(
                 """
-                INSERT INTO ppa_log (eid, from_period, to_period, hours, reason, created_at, created_by, status)
-                VALUES ($1, $2, $3, $4, $5, NOW(), $6, 'pending')
+                INSERT INTO ppa_log (eid, from_period, to_period, hours, hours_chargeable, hours_standard, reason, created_at, created_by, status)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), $8, 'pending')
                 RETURNING id::text
                 """,
-                body.eid, body.from_period, body.to_period, body.hours, body.reason or None, created_by or None,
+                body.eid, body.from_period, body.to_period,
+                total_hours, body.hours_chargeable, body.hours_standard,
+                body.reason or None, created_by or None,
             )
     return {"ok": True, "id": row["id"]}
 
