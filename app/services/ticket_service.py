@@ -16,6 +16,7 @@ REQUIRED_FIELDS: dict = {
     "sick":    ["eid", "start_date", "end_date"],
     "nj":      ["nj_name", "cl", "location", "people_lead", "start_date", "te_approver"],
     "baja":    ["eid", "end_date"],
+    "ppa":     ["eid", "hours_to_move", "from_period", "to_period"],
 }
 
 
@@ -494,6 +495,30 @@ async def _apply_approval_side_effects(conn, ticket: dict, request_id: str):
             )
         logger.bind(request_id=request_id).info("baja applied to employees", eid=eid)
 
+    elif t_type == "ppa":
+        from app.services import ppa_service as _ppa
+        from app.country import to_iso
+        hours = ticket.get("hours_to_move") or 0
+        from_period = ticket.get("from_period")
+        to_period = ticket.get("to_period")
+        country_raw = ticket.get("eid_country")
+        country = to_iso(country_raw, country_raw) if country_raw else "AR"
+        await _ppa._apply_ppa_to_forecast_periods(conn, eid, from_period, to_period, hours)
+        await _ppa._apply_ppa_to_daily_hours(conn, eid, from_period, to_period, hours, country)
+        await conn.execute(
+            """
+            UPDATE ppa_log SET status='approved', resolved_at=NOW(), resolved_by=$1
+            WHERE id = (
+                SELECT id FROM ppa_log
+                WHERE eid=$2 AND from_period=$3 AND to_period=$4 AND status='pending'
+                ORDER BY created_at DESC
+                LIMIT 1
+            )
+            """,
+            request_id, eid, from_period, to_period,
+        )
+        logger.bind(request_id=request_id).info("ppa applied on ticket approval", eid=eid)
+
 
 async def _recalculate_all_periods_for_eid(conn, eid: str, request_id: str):
     try:
@@ -580,7 +605,21 @@ async def reject_ticket(ticket_id: int, reason: str, request_id: str) -> dict:
             )
             if not row:
                 raise ForecastException(AppError.TICKET_NOT_FOUND)
-            return await _fetch_full_ticket(conn, row["id"])
+            ticket = await _fetch_full_ticket(conn, row["id"])
+            if ticket.get("type") == "ppa" and ticket.get("eid"):
+                await conn.execute(
+                    """
+                    UPDATE ppa_log SET status='rejected', rejection_reason=$1, resolved_at=NOW()
+                    WHERE id = (
+                        SELECT id FROM ppa_log
+                        WHERE eid=$2 AND from_period=$3 AND to_period=$4 AND status='pending'
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                    )
+                    """,
+                    reason, ticket["eid"], ticket.get("from_period"), ticket.get("to_period"),
+                )
+            return ticket
         except ForecastException:
             raise
         except Exception as e:

@@ -195,7 +195,25 @@ async def create(body: PPACreate, created_by: str, request_id: str) -> dict:
                 total_hours, body.hours_chargeable, body.hours_standard,
                 body.reason or None, created_by or None,
             )
-    return {"ok": True, "id": row["id"]}
+            ppa_log_id = row["id"]
+            await conn.execute(
+                """
+                INSERT INTO tickets (
+                    type, eid, detail, status, date, created_by,
+                    hours_to_move, from_period, to_period, scenario_type
+                ) VALUES (
+                    'ppa', $1, $2, 'Open', CURRENT_DATE, $3,
+                    $4, $5, $6, 'assumption'
+                )
+                """,
+                body.eid,
+                body.reason or f"PPA {body.from_period} → {body.to_period} (log:{ppa_log_id})",
+                created_by or None,
+                total_hours,
+                body.from_period,
+                body.to_period,
+            )
+    return {"ok": True, "id": ppa_log_id}
 
 
 async def approve(ppa_id: str, approved_by: str, request_id: str) -> dict:

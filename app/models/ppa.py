@@ -12,7 +12,7 @@ class PPACreate(BaseModel):
 
     @model_validator(mode="after")
     def at_least_one_hours_field(self):
-        if not self.hours_chargeable and not self.hours_standard:
+        if self.hours_chargeable is None and self.hours_standard is None:
             raise ValueError("At least one of hours_chargeable or hours_standard is required")
         return self
 

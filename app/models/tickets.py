@@ -1,7 +1,7 @@
 from typing import Optional
 from pydantic import BaseModel
 
-VALID_TICKET_TYPES = {"newproj", "ongoing", "pto", "sick", "nj", "baja"}
+VALID_TICKET_TYPES = {"newproj", "ongoing", "pto", "sick", "nj", "baja", "ppa"}
 VALID_SCENARIO_TYPES = {"assumption", "effective"}
 
 
