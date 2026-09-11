@@ -46,67 +46,82 @@ async def _get_workdays(conn, period_name: str, country: str) -> list[date]:
     ]
 
 
-async def _apply_ppa_to_daily_hours(conn, eid, from_period, to_period, hours, country):
+async def _apply_ppa_to_daily_hours(conn, eid, from_period, to_period, hours_chargeable, hours_standard, country):
     """Reparte el PPA dia a dia en employee_daily_hours.
 
     Esta tabla ya NO alimenta la vista global (state_service y totals_service leen
     forecast_periods). Se mantiene porque la granularidad diaria es lo que necesita la
     vista Diaria; el impacto en los totales lo aplica _apply_ppa_to_forecast_periods.
+    hours_chargeable va a chg_ppa (HL), hours_standard va a chg_ppa_sl (SAH).
     """
     for period_name, sign in [(from_period, -1), (to_period, 1)]:
         workdays = await _get_workdays(conn, period_name, country)
         if not workdays:
             logger.warning(f"No workdays found for period {period_name}, skipping PPA distribution")
             continue
-        amounts = _distribute(Decimal(hours), len(workdays))
+        n = len(workdays)
+        amounts_hl = _distribute(Decimal(hours_chargeable or 0), n)
+        amounts_sl = _distribute(Decimal(hours_standard or 0), n)
         await conn.executemany(
             """
-            INSERT INTO employee_daily_hours (eid, date, sah, chg_hl, chg_sl, chg_ppa, updated_at)
-            VALUES ($1, $2, 0, 0, 0, $3, NOW())
+            INSERT INTO employee_daily_hours (eid, date, sah, chg_hl, chg_sl, chg_ppa, chg_ppa_sl, updated_at)
+            VALUES ($1, $2, 0, 0, 0, $3, $4, NOW())
             ON CONFLICT (eid, date) DO UPDATE SET
-                chg_ppa    = employee_daily_hours.chg_ppa + $3,
+                chg_ppa    = employee_daily_hours.chg_ppa    + $3,
+                chg_ppa_sl = employee_daily_hours.chg_ppa_sl + $4,
                 updated_at = NOW()
             """,
-            [(eid, d, amount * sign) for d, amount in zip(workdays, amounts)],
+            [(eid, d, ahl * sign, asl * sign) for d, ahl, asl in zip(workdays, amounts_hl, amounts_sl)],
         )
-    logger.info("PPA applied to daily hours", eid=eid, from_period=from_period, to_period=to_period, hours=hours)
+    logger.info(
+        "PPA applied to daily hours",
+        eid=eid, from_period=from_period, to_period=to_period,
+        hours_chargeable=hours_chargeable, hours_standard=hours_standard,
+    )
 
 
-# Acumula las horas del PPA en forecast_periods.chg_cascadeadas y rederiva las columnas
-# que dependen de ella, con las mismas formulas que usa la vista global:
-#   chg        = chg_hl + chg_sl + chg_cascadeadas
-#   chg_pct    = chg / sah * 100
-#   chg_pct_hl = (chg_hl + chg_cascadeadas) / sah * 100
-# chg_sl y chg_pct_sl no se tocan: el PPA no es soft lock.
-# El $3 es el delta con signo, y se suma dentro del mismo UPDATE para que el
-# read-modify-write quede serializado por el lock de fila de Postgres.
+# Acumula las horas del PPA en forecast_periods separando HL (chargeable) y SL (standard).
+# $1=eid, $2=period_name, $3=delta_hl, $4=delta_sl
+# chg_cascadeadas se mantiene como HL+SL para compatibilidad con recalculate.
+# El read-modify-write queda serializado por el lock de fila de Postgres.
 _UPSERT_PPA_FP = """
     INSERT INTO forecast_periods (
         eid, period_name, chg, sah, chg_pct,
-        chg_hl, chg_sl, chg_cascadeadas, absence_hours, chg_pct_hl, chg_pct_sl
+        chg_hl, chg_sl, chg_cascadeadas, chg_cascadeadas_hl, chg_cascadeadas_sl,
+        absence_hours, chg_pct_hl, chg_pct_sl
     )
-    VALUES ($1, $2, $3, 0, 0, 0, 0, $3, 0, 0, 0)
+    VALUES ($1, $2, $3::numeric + $4::numeric, 0, 0, 0, 0, $3::numeric + $4::numeric, $3::numeric, $4::numeric, 0, 0, 0)
     ON CONFLICT (eid, period_name) DO UPDATE SET
-        chg_cascadeadas = COALESCE(forecast_periods.chg_cascadeadas, 0) + $3,
-        chg             = COALESCE(forecast_periods.chg_hl, 0)
-                        + COALESCE(forecast_periods.chg_sl, 0)
-                        + COALESCE(forecast_periods.chg_cascadeadas, 0) + $3,
-        chg_pct         = CASE WHEN COALESCE(forecast_periods.sah, 0) > 0
-                               THEN ROUND((COALESCE(forecast_periods.chg_hl, 0)
-                                         + COALESCE(forecast_periods.chg_sl, 0)
-                                         + COALESCE(forecast_periods.chg_cascadeadas, 0) + $3)
-                                          / forecast_periods.sah * 100, 2)
-                               ELSE 0 END,
-        chg_pct_hl      = CASE WHEN COALESCE(forecast_periods.sah, 0) > 0
-                               THEN ROUND((COALESCE(forecast_periods.chg_hl, 0)
-                                         + COALESCE(forecast_periods.chg_cascadeadas, 0) + $3)
-                                          / forecast_periods.sah * 100, 2)
-                               ELSE 0 END
+        chg_cascadeadas_hl = COALESCE(forecast_periods.chg_cascadeadas_hl, 0) + $3,
+        chg_cascadeadas_sl = COALESCE(forecast_periods.chg_cascadeadas_sl, 0) + $4,
+        chg_cascadeadas    = COALESCE(forecast_periods.chg_cascadeadas_hl, 0) + $3
+                           + COALESCE(forecast_periods.chg_cascadeadas_sl, 0) + $4,
+        chg                = COALESCE(forecast_periods.chg_hl, 0)
+                           + COALESCE(forecast_periods.chg_sl, 0)
+                           + COALESCE(forecast_periods.chg_cascadeadas_hl, 0) + $3
+                           + COALESCE(forecast_periods.chg_cascadeadas_sl, 0) + $4,
+        chg_pct            = CASE WHEN COALESCE(forecast_periods.sah, 0) > 0
+                                  THEN ROUND((COALESCE(forecast_periods.chg_hl, 0)
+                                            + COALESCE(forecast_periods.chg_sl, 0)
+                                            + COALESCE(forecast_periods.chg_cascadeadas_hl, 0) + $3
+                                            + COALESCE(forecast_periods.chg_cascadeadas_sl, 0) + $4)
+                                             / forecast_periods.sah * 100, 2)
+                                  ELSE 0 END,
+        chg_pct_hl         = CASE WHEN COALESCE(forecast_periods.sah, 0) > 0
+                                  THEN ROUND((COALESCE(forecast_periods.chg_hl, 0)
+                                            + COALESCE(forecast_periods.chg_cascadeadas_hl, 0) + $3)
+                                             / forecast_periods.sah * 100, 2)
+                                  ELSE 0 END,
+        chg_pct_sl         = CASE WHEN COALESCE(forecast_periods.sah, 0) > 0
+                                  THEN ROUND((COALESCE(forecast_periods.chg_sl, 0)
+                                            + COALESCE(forecast_periods.chg_cascadeadas_sl, 0) + $4)
+                                             / forecast_periods.sah * 100, 2)
+                                  ELSE 0 END
 """
 
 
-async def _apply_ppa_to_forecast_periods(conn, eid, from_period, to_period, hours):
-    """Impacta el PPA en forecast_periods, que es lo que lee la vista global.
+async def _apply_ppa_to_forecast_periods(conn, eid, from_period, to_period, hours_chargeable, hours_standard):
+    """Impacta el PPA en forecast_periods separando HL y SL.
 
     Decision sobre from_period: se DESCUENTA del origen y se SUMA al destino. No es una
     eleccion nueva, es la semantica que ya tenian los dos caminos que existian:
@@ -120,8 +135,9 @@ async def _apply_ppa_to_forecast_periods(conn, eid, from_period, to_period, hour
     es el resultado correcto. En ppa_log hay filas asi (por ejemplo Feb-P1 -> Feb-P1).
     """
     for period_name, sign in [(from_period, -1), (to_period, 1)]:
-        delta = Decimal(hours) * sign
-        result = await conn.execute(_UPSERT_PPA_FP, eid, period_name, delta)
+        delta_hl = Decimal(hours_chargeable or 0) * sign
+        delta_sl = Decimal(hours_standard or 0) * sign
+        result = await conn.execute(_UPSERT_PPA_FP, eid, period_name, delta_hl, delta_sl)
         # Si no se escribio ninguna fila el total del periodo quedaria sin el PPA y la
         # aprobacion mentiria. Se corta la transaccion en vez de aprobar a medias.
         if result and result.split()[-1] == "0":
@@ -131,8 +147,33 @@ async def _apply_ppa_to_forecast_periods(conn, eid, from_period, to_period, hour
             )
     logger.info(
         "PPA applied to forecast_periods",
-        eid=eid, from_period=from_period, to_period=to_period, hours=hours,
+        eid=eid, from_period=from_period, to_period=to_period,
+        hours_chargeable=hours_chargeable, hours_standard=hours_standard,
     )
+
+
+async def get_by_id(ppa_id: str) -> dict:
+    async with db.pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT p.id::text AS id, p.eid, e.name,
+                   p.from_period AS "from", p.to_period AS "to",
+                   p.hours AS hs, p.hours_chargeable, p.hours_standard,
+                   p.reason, p.status, p.rejection_reason,
+                   TO_CHAR(p.created_at,'DD/MM/YY') AS date,
+                   p.created_by, COALESCE(uc.email, p.created_by) AS created_by_name, p.created_at,
+                   p.resolved_by, COALESCE(ur.email, p.resolved_by) AS resolved_by_name, p.resolved_at,
+                   p.reversed_by, COALESCE(uv.email, p.reversed_by) AS reversed_by_name, p.reversed_at,
+                   COALESCE(e.country, e.location) AS country
+            FROM ppa_log p
+            LEFT JOIN employees e ON p.eid = e.eid
+            LEFT JOIN users uc ON uc.eid = p.created_by OR uc.email = p.created_by OR uc.id::text = p.created_by
+            LEFT JOIN users ur ON ur.eid = p.resolved_by OR ur.email = p.resolved_by OR ur.id::text = p.resolved_by
+            LEFT JOIN users uv ON uv.eid = p.reversed_by OR uv.email = p.reversed_by OR uv.id::text = p.reversed_by
+            WHERE p.id = $1
+        """, int(ppa_id))
+        if not row:
+            raise ForecastException(AppError.NOT_FOUND, "PPA no encontrado")
+        return dict(row)
 
 
 async def list_ppa(eid=None, from_period=None, status=None, page=1, page_size=25):
@@ -156,7 +197,8 @@ async def list_ppa(eid=None, from_period=None, status=None, page=1, page_size=25
         rows = await conn.fetch(f"""
             SELECT p.id::text AS id, p.eid, e.name,
                    p.from_period AS "from", p.to_period AS "to",
-                   p.hours AS hs, p.reason, p.status, p.rejection_reason,
+                   p.hours AS hs, p.hours_chargeable, p.hours_standard,
+                   p.reason, p.status, p.rejection_reason,
                    TO_CHAR(p.created_at,'DD/MM/YY') AS date,
                    COALESCE(e.country, e.location) AS country,
                    COUNT(*) OVER () AS _total
@@ -200,16 +242,19 @@ async def create(body: PPACreate, created_by: str, request_id: str) -> dict:
                 """
                 INSERT INTO tickets (
                     type, eid, detail, status, date, created_by,
-                    hours_to_move, from_period, to_period, scenario_type
+                    hours_to_move, hours_chargeable, hours_standard,
+                    from_period, to_period, scenario_type
                 ) VALUES (
                     'ppa', $1, $2, 'Open', CURRENT_DATE, $3,
-                    $4, $5, $6, 'assumption'
+                    $4, $5, $6, $7, $8, 'assumption'
                 )
                 """,
                 body.eid,
                 body.reason or f"PPA {body.from_period} → {body.to_period} (log:{ppa_log_id})",
                 created_by or None,
                 total_hours,
+                body.hours_chargeable,
+                body.hours_standard,
                 body.from_period,
                 body.to_period,
             )
@@ -227,7 +272,8 @@ async def approve(ppa_id: str, approved_by: str, request_id: str) -> dict:
             # asi dos aprobaciones simultaneas del mismo PPA no lo aplican dos veces.
             ppa = await conn.fetchrow(
                 """
-                SELECT p.id, p.eid, p.from_period, p.to_period, p.hours, p.status,
+                SELECT p.id, p.eid, p.from_period, p.to_period,
+                       p.hours, p.hours_chargeable, p.hours_standard, p.status,
                        COALESCE(e.country, e.location) AS country
                 FROM ppa_log p LEFT JOIN employees e ON p.eid = e.eid
                 WHERE p.id = $1
@@ -243,16 +289,21 @@ async def approve(ppa_id: str, approved_by: str, request_id: str) -> dict:
             # Primero forecast_periods, que es lo que alimenta la vista global
             await _apply_ppa_to_forecast_periods(
                 conn, eid=ppa["eid"], from_period=ppa["from_period"],
-                to_period=ppa["to_period"], hours=ppa["hours"],
+                to_period=ppa["to_period"],
+                hours_chargeable=ppa["hours_chargeable"],
+                hours_standard=ppa["hours_standard"],
             )
             # Y despues el detalle diario, que solo consume la vista Diaria
             await _apply_ppa_to_daily_hours(
                 conn, eid=ppa["eid"], from_period=ppa["from_period"],
-                to_period=ppa["to_period"], hours=ppa["hours"], country=country,
+                to_period=ppa["to_period"],
+                hours_chargeable=ppa["hours_chargeable"],
+                hours_standard=ppa["hours_standard"],
+                country=country,
             )
             await conn.execute(
                 "UPDATE ppa_log SET status='approved', resolved_at=NOW(), resolved_by=$1 WHERE id=$2",
-                approved_by, int(ppa_id),
+                approved_by or None, int(ppa_id),
             )
     duration = int((time.monotonic() - start) * 1000)
     logger.bind(action="ppa:approve", request_id=request_id, duration_ms=duration).info("PPA approved", ppa_id=ppa_id)
@@ -269,6 +320,50 @@ async def reject(ppa_id: str, reason: str, rejected_by: str, request_id: str) ->
             raise ForecastException(AppError.VALIDATION_ERROR, "El PPA no esta pendiente")
         await conn.execute(
             "UPDATE ppa_log SET status= 'rejected', rejection_reason=$1, resolved_at=NOW(), resolved_by=$2 WHERE id=$3",
-            reason, rejected_by, int(ppa_id),
+            reason, rejected_by or None, int(ppa_id),
         )
+    return {"ok": True}
+
+
+async def reverse(ppa_id: str, reversed_by: str, request_id: str) -> dict:
+    logger.bind(action="ppa:reverse", request_id=request_id).info("Reversing PPA", ppa_id=ppa_id)
+    async with db.pool.acquire() as conn:
+        async with conn.transaction():
+            ppa = await conn.fetchrow(
+                """
+                SELECT p.id, p.eid, p.from_period, p.to_period,
+                       p.hours_chargeable, p.hours_standard, p.status,
+                       COALESCE(e.country, e.location) AS country
+                FROM ppa_log p LEFT JOIN employees e ON p.eid = e.eid
+                WHERE p.id = $1
+                FOR UPDATE OF p
+                """,
+                int(ppa_id),
+            )
+            if not ppa:
+                raise ForecastException(AppError.NOT_FOUND, "PPA no encontrado")
+            if ppa["status"] != "approved":
+                raise ForecastException(AppError.VALIDATION_ERROR, "Solo se puede revertir un PPA aprobado")
+            # Invert from/to so the delta sign is reversed relative to the original approve
+            await _apply_ppa_to_forecast_periods(
+                conn, eid=ppa["eid"],
+                from_period=ppa["to_period"],
+                to_period=ppa["from_period"],
+                hours_chargeable=ppa["hours_chargeable"],
+                hours_standard=ppa["hours_standard"],
+            )
+            country = to_iso(ppa["country"], ppa["country"])
+            await _apply_ppa_to_daily_hours(
+                conn, eid=ppa["eid"],
+                from_period=ppa["to_period"],
+                to_period=ppa["from_period"],
+                hours_chargeable=ppa["hours_chargeable"],
+                hours_standard=ppa["hours_standard"],
+                country=country,
+            )
+            await conn.execute(
+                "UPDATE ppa_log SET status='reversed', reversed_at=NOW(), reversed_by=$1 WHERE id=$2",
+                reversed_by or None, int(ppa_id),
+            )
+    logger.bind(action="ppa:reverse", request_id=request_id).info("PPA reversed", ppa_id=ppa_id)
     return {"ok": True}

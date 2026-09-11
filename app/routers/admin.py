@@ -18,6 +18,7 @@ async def get_audit_log(
     page_size: int = Query(default=50, ge=1, le=200),
     user_id: Optional[int] = None,
     ticket_id: Optional[int] = None,
+    ppa_log_id: Optional[int] = None,
     action: Optional[str] = None,
     success: Optional[bool] = None,
     from_date: Optional[str] = None,
@@ -39,6 +40,12 @@ async def get_audit_log(
         params.append(f"/api/tickets/{ticket_id}/%")
         idx_ep = len(params)
         params.append(f"%ticket #{ticket_id}%")
+        idx_ac = len(params)
+        conditions.append(f"(endpoint LIKE ${idx_ep} OR action ILIKE ${idx_ac})")
+    if ppa_log_id is not None:
+        params.append(f"/api/ppa/{ppa_log_id}%")
+        idx_ep = len(params)
+        params.append(f"%PPA: {ppa_log_id}%")
         idx_ac = len(params)
         conditions.append(f"(endpoint LIKE ${idx_ep} OR action ILIKE ${idx_ac})")
     if action is not None:

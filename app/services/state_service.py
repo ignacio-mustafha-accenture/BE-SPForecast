@@ -228,17 +228,22 @@ async def get_state(window_offset: int = 0) -> dict:
                 COALESCE(fp.sah, 0)                                                 AS sah,
                 COALESCE(fp.chg_hl, 0)                                              AS chg_hl,
                 COALESCE(fp.chg_sl, 0)                                              AS chg_sl,
-                COALESCE(fp.chg_cascadeadas, 0)                                     AS chg_cascadeadas,
-                COALESCE(fp.chg_hl, 0) + COALESCE(fp.chg_sl, 0)                     AS chg_neto,
+                COALESCE(fp.chg_cascadeadas_hl, 0)                                  AS chg_cascadeadas_hl,
+                COALESCE(fp.chg_cascadeadas_sl, 0)                                  AS chg_cascadeadas_sl,
+                COALESCE(fp.chg_cascadeadas_hl, 0)
+                  + COALESCE(fp.chg_cascadeadas_sl, 0)                              AS chg_cascadeadas,
+                COALESCE(fp.chg_hl, 0) + COALESCE(fp.chg_sl, 0)                    AS chg_neto,
                 COALESCE(fp.chg_hl, 0) + COALESCE(fp.chg_sl, 0)
-                                       + COALESCE(fp.chg_cascadeadas, 0)            AS chg,
+                  + COALESCE(fp.chg_cascadeadas_hl, 0)
+                  + COALESCE(fp.chg_cascadeadas_sl, 0)                              AS chg,
                 COALESCE(fp.absence_hours, 0)                                       AS absence_hours,
                 CASE WHEN COALESCE(fp.sah, 0) > 0
-                     THEN ROUND((COALESCE(fp.chg_hl, 0) + COALESCE(fp.chg_cascadeadas, 0))
+                     THEN ROUND((COALESCE(fp.chg_hl, 0) + COALESCE(fp.chg_cascadeadas_hl, 0))
                                 / fp.sah * 100, 2)
                      ELSE 0 END                                                     AS chg_pct_hl,
                 CASE WHEN COALESCE(fp.sah, 0) > 0
-                     THEN ROUND(COALESCE(fp.chg_sl, 0) / fp.sah * 100, 2)
+                     THEN ROUND((COALESCE(fp.chg_sl, 0) + COALESCE(fp.chg_cascadeadas_sl, 0))
+                                / fp.sah * 100, 2)
                      ELSE 0 END                                                     AS chg_pct_sl
             FROM forecast_periods fp
             WHERE fp.period_name = ANY($1)
@@ -266,30 +271,34 @@ async def get_state(window_offset: int = 0) -> dict:
             if fp["eid"] not in forecast_map:
                 forecast_map[fp["eid"]] = {}
             forecast_map[fp["eid"]][fp["period_name"]] = {
-                "chg":             float(fp["chg"] or 0),
-                "chg_neto":        float(fp["chg_neto"] or 0),
-                "sah":             float(fp["sah"] or 0),
-                "chg_hl":          float(fp["chg_hl"] or 0),
-                "chg_sl":          float(fp["chg_sl"] or 0),
-                "chg_cascadeadas": float(fp["chg_cascadeadas"] or 0),
-                "absence_hours":   float(fp["absence_hours"] or 0),
-                "chg_pct_sl":      float(fp["chg_pct_sl"] or 0),
-                "chg_pct_hl":      float(fp["chg_pct_hl"] or 0),
+                "chg":                float(fp["chg"] or 0),
+                "chg_neto":           float(fp["chg_neto"] or 0),
+                "sah":                float(fp["sah"] or 0),
+                "chg_hl":             float(fp["chg_hl"] or 0),
+                "chg_sl":             float(fp["chg_sl"] or 0),
+                "chg_cascadeadas":    float(fp["chg_cascadeadas"] or 0),
+                "chg_cascadeadas_hl": float(fp["chg_cascadeadas_hl"] or 0),
+                "chg_cascadeadas_sl": float(fp["chg_cascadeadas_sl"] or 0),
+                "absence_hours":      float(fp["absence_hours"] or 0),
+                "chg_pct_sl":         float(fp["chg_pct_sl"] or 0),
+                "chg_pct_hl":         float(fp["chg_pct_hl"] or 0),
             }
 
         employees = []
         for e in emp_rows:
             row = dict(e)
             fp = forecast_map.get(row["EID"], {})
-            chg_arr             = [float(fp.get(pn, {}).get("chg", 0))             for pn in period_names]
-            chg_neto_arr        = [float(fp.get(pn, {}).get("chg_neto", 0))        for pn in period_names]
-            sah_arr             = [float(fp.get(pn, {}).get("sah", 0))             for pn in period_names]
-            chg_hl_arr          = [float(fp.get(pn, {}).get("chg_hl", 0))          for pn in period_names]
-            chg_sl_arr          = [float(fp.get(pn, {}).get("chg_sl", 0))          for pn in period_names]
-            chg_cascadeadas_arr = [float(fp.get(pn, {}).get("chg_cascadeadas", 0)) for pn in period_names]
-            absence_hours_arr   = [float(fp.get(pn, {}).get("absence_hours", 0))   for pn in period_names]
-            chg_pct_sl_arr      = [float(fp.get(pn, {}).get("chg_pct_sl", 0))      for pn in period_names]
-            chg_pct_hl_arr      = [float(fp.get(pn, {}).get("chg_pct_hl", 0))      for pn in period_names]
+            chg_arr                = [float(fp.get(pn, {}).get("chg", 0))                for pn in period_names]
+            chg_neto_arr           = [float(fp.get(pn, {}).get("chg_neto", 0))           for pn in period_names]
+            sah_arr                = [float(fp.get(pn, {}).get("sah", 0))                for pn in period_names]
+            chg_hl_arr             = [float(fp.get(pn, {}).get("chg_hl", 0))             for pn in period_names]
+            chg_sl_arr             = [float(fp.get(pn, {}).get("chg_sl", 0))             for pn in period_names]
+            chg_cascadeadas_arr    = [float(fp.get(pn, {}).get("chg_cascadeadas", 0))    for pn in period_names]
+            chg_cascadeadas_hl_arr = [float(fp.get(pn, {}).get("chg_cascadeadas_hl", 0)) for pn in period_names]
+            chg_cascadeadas_sl_arr = [float(fp.get(pn, {}).get("chg_cascadeadas_sl", 0)) for pn in period_names]
+            absence_hours_arr      = [float(fp.get(pn, {}).get("absence_hours", 0))      for pn in period_names]
+            chg_pct_sl_arr         = [float(fp.get(pn, {}).get("chg_pct_sl", 0))         for pn in period_names]
+            chg_pct_hl_arr         = [float(fp.get(pn, {}).get("chg_pct_hl", 0))         for pn in period_names]
 
             ak = kind_map.get(row["EID"], {})
             assumption_kind_arr = [ak.get(pn) for pn in period_names]
@@ -310,17 +319,19 @@ async def get_state(window_offset: int = 0) -> dict:
 
             row.update({
                 "ScenarioType": scenario,
-                "chg":             chg_arr,
-                "chg_neto":        chg_neto_arr,
-                "sah":             sah_arr,
-                "cp":              chg_pct_hl_arr,
-                "chg_hl":          chg_hl_arr,
-                "chg_sl":          chg_sl_arr,
-                "chg_cascadeadas": chg_cascadeadas_arr,
-                "absence_hours":   absence_hours_arr,
-                "chg_pct_sl":      chg_pct_sl_arr,
-                "chg_pct_hl":      chg_pct_hl_arr,
-                "assumption_kind": assumption_kind_arr,
+                "chg":                chg_arr,
+                "chg_neto":           chg_neto_arr,
+                "sah":                sah_arr,
+                "cp":                 chg_pct_hl_arr,
+                "chg_hl":             chg_hl_arr,
+                "chg_sl":             chg_sl_arr,
+                "chg_cascadeadas":    chg_cascadeadas_arr,
+                "chg_cascadeadas_hl": chg_cascadeadas_hl_arr,
+                "chg_cascadeadas_sl": chg_cascadeadas_sl_arr,
+                "absence_hours":      absence_hours_arr,
+                "chg_pct_sl":         chg_pct_sl_arr,
+                "chg_pct_hl":         chg_pct_hl_arr,
+                "assumption_kind":    assumption_kind_arr,
                 "NJFormat": (
                     f"{row['Name']} | {row['HireDate']} | CL{row['CL']} | {row['Country']}"
                     if row.get("NewJoiner") else None
@@ -371,8 +382,8 @@ async def get_state(window_offset: int = 0) -> dict:
         ppa_rows = await conn.fetch("""
             SELECT p.id::text AS id, p.eid, e.name,
                    p.from_period AS "from", p.to_period AS "to",
-                   p.hours AS hs, p.reason,
-                   TO_CHAR(p.created_at,'DD/MM/YY') AS date
+                   p.hours AS hs, p.hours_chargeable, p.hours_standard,
+                   p.reason, TO_CHAR(p.created_at,'DD/MM/YY') AS date
             FROM ppa_log p LEFT JOIN employees e ON p.eid=e.eid
             ORDER BY p.created_at DESC
         """)

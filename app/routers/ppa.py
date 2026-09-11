@@ -25,18 +25,35 @@ async def list_ppa(
 async def create_ppa(body: PPACreate, request: Request):
     request.state.action = f"Create PPA: {body.eid}"
     user = request.state.user
-    return await ppa_service.create(body, user.get("eid"), request.state.request_id)
+    actor = user.get("eid") or user.get("email")
+    return await ppa_service.create(body, actor, request.state.request_id)
+
+
+@router.get("/{ppa_id}", dependencies=[require_permission("ppa:read")])
+async def get_ppa(ppa_id: str, request: Request):
+    request.state.action = f"Get PPA: {ppa_id}"
+    return await ppa_service.get_by_id(ppa_id)
 
 
 @router.post("/{ppa_id}/approve", dependencies=[require_permission("ppa:approve")])
 async def approve_ppa(ppa_id: str, request: Request):
     request.state.action = f"Approve PPA: {ppa_id}"
     user = request.state.user
-    return await ppa_service.approve(ppa_id, user.get("eid"), request.state.request_id)
+    actor = user.get("eid") or user.get("email")
+    return await ppa_service.approve(ppa_id, actor, request.state.request_id)
 
 
 @router.post("/{ppa_id}/reject", dependencies=[require_permission("ppa:reject")])
 async def reject_ppa(ppa_id: str, body: PPAReject, request: Request):
     request.state.action = f"Reject PPA: {ppa_id}"
     user = request.state.user
-    return await ppa_service.reject(ppa_id, body.reason, user.get("eid"), request.state.request_id)
+    actor = user.get("eid") or user.get("email")
+    return await ppa_service.reject(ppa_id, body.reason, actor, request.state.request_id)
+
+
+@router.post("/{ppa_id}/reverse", dependencies=[require_permission("ppa:reverse")])
+async def reverse_ppa(ppa_id: str, request: Request):
+    request.state.action = f"Reverse PPA: {ppa_id}"
+    user = request.state.user
+    actor = user.get("eid") or user.get("email")
+    return await ppa_service.reverse(ppa_id, actor, request.state.request_id)

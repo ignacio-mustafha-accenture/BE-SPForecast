@@ -28,7 +28,16 @@ class PPAOut(BaseModel):
     from_period: str
     to_period: str
     hours: int
+    hours_chargeable: Optional[int] = None
+    hours_standard: Optional[int] = None
     reason: Optional[str]
     status: str
-    rejection_reason: Optional[str]
-    date: Optional[str]
+    rejection_reason: Optional[str] = None
+    date: Optional[str] = None
+    country: Optional[str] = None
+    created_by: Optional[str] = None
+    created_at: Optional[str] = None
+    resolved_by: Optional[str] = None
+    resolved_at: Optional[str] = None
+    reversed_by: Optional[str] = None
+    reversed_at: Optional[str] = None
