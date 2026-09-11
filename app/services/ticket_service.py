@@ -7,6 +7,7 @@ from app.config import settings
 from app.errors import AppError, ForecastException
 from app.models.tickets import TicketCreate, TicketUpdate, VALID_TICKET_TYPES
 from app.services.assumption_service import get_assumption_num, upsert_projection_blocks
+from app.services.daily_hours_service import recalculate_daily_hours_for_eid
 
 REQUIRED_FIELDS: dict = {
     "newproj": ["eid", "client_name", "offering_type", "chargeability_pct", "start_date", "end_date"],
@@ -15,6 +16,7 @@ REQUIRED_FIELDS: dict = {
     "sick":    ["eid", "start_date", "end_date"],
     "nj":      ["nj_name", "cl", "location", "people_lead", "start_date", "te_approver"],
     "baja":    ["eid", "end_date"],
+    "ppa":     ["eid", "hours_to_move", "from_period", "to_period"],
 }
 
 
@@ -111,7 +113,8 @@ async def _fetch_full_ticket(conn, ticket_id: str) -> dict:
                COALESCE(e.name, u.full_name, t.created_by::text) AS "by",
                t.nj_name, t.cl, t.location, t.people_lead,
                t.client_name, t.offering_type, t.chargeability_pct,
-               t.hours_to_move, t.from_period, t.to_period, t.comments,
+               t.hours_to_move, t.hours_chargeable, t.hours_standard,
+               t.from_period, t.to_period, t.comments,
                t.start_date::text AS start_date,
                t.end_date::text AS end_date,
                t.rejection_reason,
@@ -134,6 +137,7 @@ async def get_ticket(ticket_id: int) -> dict:
             SELECT t.id::text AS id, t.type, t.eid, t.detail, t.status,
                    TO_CHAR(t.date,'DD/MM/YY') AS date,
                    COALESCE(e.name, u.full_name, t.created_by::text) AS "by",
+                   COALESCE(u.email, ue.email, t.created_by::text) AS created_by_email,
                    t.nj_name, t.cl, t.location, t.people_lead,
                    t.client_name, t.offering_type, t.chargeability_pct,
                    t.hours_to_move, t.from_period, t.to_period, t.comments,
@@ -143,10 +147,25 @@ async def get_ticket(ticket_id: int) -> dict:
                    COALESCE(t.scenario_type, 'assumption') AS scenario_type,
                    t.effectivization_date::text AS effectivization_date,
                    COALESCE(emp.name, t.nj_name) AS eid_name,
-                   COALESCE(emp.country, emp.location) AS eid_country
+                   COALESCE(emp.country, emp.location) AS eid_country,
+                   CASE WHEN t.type = 'ppa' THEN (
+                       SELECT pl.id::text FROM ppa_log pl
+                       WHERE pl.eid = t.eid
+                         AND pl.from_period = t.from_period
+                         AND pl.to_period = t.to_period
+                       ORDER BY pl.created_at DESC LIMIT 1
+                   ) END AS ppa_log_id,
+                   CASE WHEN t.type = 'ppa' THEN (
+                       SELECT pl.status FROM ppa_log pl
+                       WHERE pl.eid = t.eid
+                         AND pl.from_period = t.from_period
+                         AND pl.to_period = t.to_period
+                       ORDER BY pl.created_at DESC LIMIT 1
+                   ) END AS ppa_log_status
             FROM tickets t
             LEFT JOIN employees e   ON t.created_by = e.eid
             LEFT JOIN users u       ON u.email = t.created_by
+            LEFT JOIN users ue      ON ue.eid = t.created_by
             LEFT JOIN employees emp ON t.eid = emp.eid
             WHERE t.id = $1
         """, ticket_id)
@@ -438,7 +457,11 @@ async def _apply_approval_side_effects(conn, ticket: dict, request_id: str):
                     """,
                     start_date_str, end_date_str,
                 )
+                start_date_obj = _d.fromisoformat(start_date_str)
+                end_date_obj = _d.fromisoformat(end_date_str)
                 for period in periods:
+                    block_start = max(start_date_obj, period["start_date"])
+                    block_end = min(end_date_obj, period["end_date"])
                     await conn.execute(
                         """
                         INSERT INTO chargeability_blocks
@@ -447,7 +470,7 @@ async def _apply_approval_side_effects(conn, ticket: dict, request_id: str):
                         VALUES ($1, $2, $3, 'effective', $4, $5, $4, 'system')
                         """,
                         eid, period["period_name"], chargeability_pct,
-                        period["start_date"], period["end_date"],
+                        block_start, block_end,
                     )
                 logger.bind(request_id=request_id).info(
                     "Effective chargeability blocks created",
@@ -488,6 +511,31 @@ async def _apply_approval_side_effects(conn, ticket: dict, request_id: str):
                 "UPDATE employees SET termination_date=$2::text::date, active=FALSE WHERE eid=$1", eid, end_date
             )
         logger.bind(request_id=request_id).info("baja applied to employees", eid=eid)
+
+    elif t_type == "ppa":
+        from app.services import ppa_service as _ppa
+        from app.country import to_iso
+        hours = ticket.get("hours_to_move") or 0
+        hours_chargeable = ticket.get("hours_chargeable") or hours
+        hours_standard = ticket.get("hours_standard") or 0
+        from_period = ticket.get("from_period")
+        to_period = ticket.get("to_period")
+        country_raw = ticket.get("eid_country")
+        country = to_iso(country_raw, country_raw) if country_raw else "AR"
+        await _ppa._apply_ppa_to_forecast_periods(conn, eid, from_period, to_period, hours_chargeable, hours_standard)
+        await _ppa._apply_ppa_to_daily_hours(conn, eid, from_period, to_period, hours_chargeable, hours_standard, country)
+        await conn.execute(
+            """
+            UPDATE ppa_log SET status='approved', resolved_at=NOW(), resolved_by=$1
+            WHERE id = (
+                SELECT id FROM ppa_log
+                WHERE eid=$2 AND from_period=$3 AND to_period=$4 AND status='pending'
+                ORDER BY created_at DESC LIMIT 1
+            )
+            """,
+            request_id, eid, from_period, to_period,
+        )
+        logger.bind(request_id=request_id).info("ppa applied on ticket approval", eid=eid)
 
 
 async def _recalculate_all_periods_for_eid(conn, eid: str, request_id: str):
@@ -534,28 +582,30 @@ async def update(ticket_id: int, body: TicketUpdate, request_id: str) -> dict:
 
 async def approve_ticket(ticket_id: int, request_id: str) -> dict:
     async with db.pool.acquire() as conn:
-        try:
-            current = await conn.fetchrow("SELECT status FROM tickets WHERE id=$1", ticket_id)
-            if not current:
-                raise ForecastException(AppError.TICKET_NOT_FOUND)
-            if current["status"] != "Open":
-                raise ForecastException(AppError.TICKET_INVALID_STATUS)
-            row = await conn.fetchrow(
-                "UPDATE tickets SET status='Approved' WHERE id=$1 RETURNING id::text, eid",
-                ticket_id,
-            )
-            if not row:
-                raise ForecastException(AppError.TICKET_NOT_FOUND)
-            ticket = await _fetch_full_ticket(conn, row["id"])
-            await _apply_approval_side_effects(conn, ticket, request_id)
-            if row["eid"]:
-                await _recalculate_all_periods_for_eid(conn, row["eid"], request_id)
-            return ticket
-        except ForecastException:
-            raise
-        except Exception as e:
-            logger.bind(request_id=request_id).exception("Unexpected error approving ticket")
-            raise ForecastException(AppError.INTERNAL_ERROR, str(e))
+        async with conn.transaction():
+            try:
+                current = await conn.fetchrow("SELECT status FROM tickets WHERE id=$1", ticket_id)
+                if not current:
+                    raise ForecastException(AppError.TICKET_NOT_FOUND)
+                if current["status"] != "Open":
+                    raise ForecastException(AppError.TICKET_INVALID_STATUS)
+                row = await conn.fetchrow(
+                    "UPDATE tickets SET status='Approved' WHERE id=$1 RETURNING id::text, eid",
+                    ticket_id,
+                )
+                if not row:
+                    raise ForecastException(AppError.TICKET_NOT_FOUND)
+                ticket = await _fetch_full_ticket(conn, row["id"])
+                await _apply_approval_side_effects(conn, ticket, request_id)
+                if row["eid"]:
+                    await _recalculate_all_periods_for_eid(conn, row["eid"], request_id)
+                    await recalculate_daily_hours_for_eid(conn, row["eid"], request_id)
+                return ticket
+            except ForecastException:
+                raise
+            except Exception as e:
+                logger.bind(request_id=request_id).exception("Unexpected error approving ticket")
+                raise ForecastException(AppError.INTERNAL_ERROR, str(e))
 
 
 async def reject_ticket(ticket_id: int, reason: str, request_id: str) -> dict:
@@ -574,7 +624,21 @@ async def reject_ticket(ticket_id: int, reason: str, request_id: str) -> dict:
             )
             if not row:
                 raise ForecastException(AppError.TICKET_NOT_FOUND)
-            return await _fetch_full_ticket(conn, row["id"])
+            ticket = await _fetch_full_ticket(conn, row["id"])
+            if ticket.get("type") == "ppa" and ticket.get("eid"):
+                await conn.execute(
+                    """
+                    UPDATE ppa_log SET status='rejected', rejection_reason=$1, resolved_at=NOW()
+                    WHERE id = (
+                        SELECT id FROM ppa_log
+                        WHERE eid=$2 AND from_period=$3 AND to_period=$4 AND status='pending'
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                    )
+                    """,
+                    reason, ticket["eid"], ticket.get("from_period"), ticket.get("to_period"),
+                )
+            return ticket
         except ForecastException:
             raise
         except Exception as e:

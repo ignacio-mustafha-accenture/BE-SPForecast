@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Query, Request
 from app.dependencies import require_permission
+from app.errors import AppError, ForecastException
 from app.models.tickets import TicketCreate, TicketUpdate, TicketAssignEID, RejectPayload
 from app.services import ticket_service
 
@@ -36,6 +37,10 @@ async def get_ticket(ticket_id: int, request: Request):
 @router.patch("/{ticket_id}/approve", dependencies=[require_permission("tickets:approve")])
 async def approve_ticket(ticket_id: int, request: Request):
     request.state.action = f"Approve ticket #{ticket_id}"
+    user = request.state.user
+    ticket = await ticket_service.get_ticket(ticket_id)
+    if ticket.get("type") == "ppa" and user.get("role") != "admin":
+        raise ForecastException(AppError.PERMISSION_DENIED)
     return await ticket_service.approve_ticket(ticket_id, request.state.request_id)
 
 

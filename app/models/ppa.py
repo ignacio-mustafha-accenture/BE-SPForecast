@@ -1,13 +1,24 @@
-from typing import Optional
-from pydantic import BaseModel
+﻿from typing import Optional
+from pydantic import BaseModel, model_validator
 
 
 class PPACreate(BaseModel):
     eid: str
     from_period: str
     to_period: str
-    hours: int
+    hours_chargeable: Optional[int] = None
+    hours_standard: Optional[int] = None
     reason: Optional[str] = None
+
+    @model_validator(mode="after")
+    def at_least_one_hours_field(self):
+        if self.hours_chargeable is None and self.hours_standard is None:
+            raise ValueError("At least one of hours_chargeable or hours_standard is required")
+        return self
+
+
+class PPAReject(BaseModel):
+    reason: str
 
 
 class PPAOut(BaseModel):
@@ -17,5 +28,16 @@ class PPAOut(BaseModel):
     from_period: str
     to_period: str
     hours: int
+    hours_chargeable: Optional[int] = None
+    hours_standard: Optional[int] = None
     reason: Optional[str]
-    date: Optional[str]
+    status: str
+    rejection_reason: Optional[str] = None
+    date: Optional[str] = None
+    country: Optional[str] = None
+    created_by: Optional[str] = None
+    created_at: Optional[str] = None
+    resolved_by: Optional[str] = None
+    resolved_at: Optional[str] = None
+    reversed_by: Optional[str] = None
+    reversed_at: Optional[str] = None

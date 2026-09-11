@@ -36,3 +36,7 @@ Thumbs.db
 
 # Testing artifacts
 cookies.txt
+
+scripts/debug/
+*.csv
+data.csv
