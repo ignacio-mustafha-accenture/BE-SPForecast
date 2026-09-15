@@ -225,25 +225,23 @@ async def get_state(window_offset: int = 0) -> dict:
             SELECT
                 fp.eid,
                 fp.period_name,
-                COALESCE(fp.sah, 0)                                                 AS sah,
+                COALESCE(fp.sah, 0)                                                  AS sah,
                 COALESCE(fp.chg_hl, 0)                                              AS chg_hl,
                 COALESCE(fp.chg_sl, 0)                                              AS chg_sl,
                 COALESCE(fp.chg_cascadeadas_hl, 0)                                  AS chg_cascadeadas_hl,
                 COALESCE(fp.chg_cascadeadas_sl, 0)                                  AS chg_cascadeadas_sl,
-                COALESCE(fp.chg_cascadeadas_hl, 0)
-                  + COALESCE(fp.chg_cascadeadas_sl, 0)                              AS chg_cascadeadas,
+                COALESCE(fp.chg_cascadeadas_hl, 0)                                  AS chg_cascadeadas,
                 COALESCE(fp.chg_hl, 0) + COALESCE(fp.chg_sl, 0)                    AS chg_neto,
                 COALESCE(fp.chg_hl, 0) + COALESCE(fp.chg_sl, 0)
-                  + COALESCE(fp.chg_cascadeadas_hl, 0)
-                  + COALESCE(fp.chg_cascadeadas_sl, 0)                              AS chg,
+                  + COALESCE(fp.chg_cascadeadas_hl, 0)                              AS chg,
                 COALESCE(fp.absence_hours, 0)                                       AS absence_hours,
                 CASE WHEN COALESCE(fp.sah, 0) > 0
                      THEN ROUND((COALESCE(fp.chg_hl, 0) + COALESCE(fp.chg_cascadeadas_hl, 0))
-                                / fp.sah * 100, 2)
+                                / COALESCE(fp.sah, 0) * 100, 2)
                      ELSE 0 END                                                     AS chg_pct_hl,
                 CASE WHEN COALESCE(fp.sah, 0) > 0
-                     THEN ROUND((COALESCE(fp.chg_sl, 0) + COALESCE(fp.chg_cascadeadas_sl, 0))
-                                / fp.sah * 100, 2)
+                     THEN ROUND(COALESCE(fp.chg_sl, 0)
+                                / COALESCE(fp.sah, 0) * 100, 2)
                      ELSE 0 END                                                     AS chg_pct_sl
             FROM forecast_periods fp
             WHERE fp.period_name = ANY($1)

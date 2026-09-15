@@ -84,38 +84,38 @@ async def _apply_ppa_to_daily_hours(conn, eid, from_period, to_period, hours_cha
 # $1=eid, $2=period_name, $3=delta_hl, $4=delta_sl
 # chg_cascadeadas se mantiene como HL+SL para compatibilidad con recalculate.
 # El read-modify-write queda serializado por el lock de fila de Postgres.
+# $1=eid, $2=period_name, $3=delta_hl, $4=delta_sl
+# delta_sl ajusta tambien sah: mover horas SL implica mover capacidad disponible entre periodos.
+# delta_hl solo ajusta CHG HL — las horas HL son facturables al cliente, no afectan la capacidad.
+# Un PPA solo mueve horas HL. $3=delta_hl afecta cascadeadas_hl, CHG y CHG%.
+# SAH y chg_sl/chg_cascadeadas_sl no se tocan: las SL son estimaciones, no son movibles.
 _UPSERT_PPA_FP = """
     INSERT INTO forecast_periods (
         eid, period_name, chg, sah, chg_pct,
         chg_hl, chg_sl, chg_cascadeadas, chg_cascadeadas_hl, chg_cascadeadas_sl,
         absence_hours, chg_pct_hl, chg_pct_sl
     )
-    VALUES ($1, $2, $3::numeric + $4::numeric, 0, 0, 0, 0, $3::numeric + $4::numeric, $3::numeric, $4::numeric, 0, 0, 0)
+    VALUES ($1, $2, $3::numeric, 0, 0, 0, 0, $3::numeric, $3::numeric, 0, 0, 0, 0)
     ON CONFLICT (eid, period_name) DO UPDATE SET
         chg_cascadeadas_hl = COALESCE(forecast_periods.chg_cascadeadas_hl, 0) + $3,
-        chg_cascadeadas_sl = COALESCE(forecast_periods.chg_cascadeadas_sl, 0) + $4,
-        chg_cascadeadas    = COALESCE(forecast_periods.chg_cascadeadas_hl, 0) + $3
-                           + COALESCE(forecast_periods.chg_cascadeadas_sl, 0) + $4,
+        chg_cascadeadas    = COALESCE(forecast_periods.chg_cascadeadas_hl, 0) + $3,
         chg                = COALESCE(forecast_periods.chg_hl, 0)
                            + COALESCE(forecast_periods.chg_sl, 0)
-                           + COALESCE(forecast_periods.chg_cascadeadas_hl, 0) + $3
-                           + COALESCE(forecast_periods.chg_cascadeadas_sl, 0) + $4,
+                           + COALESCE(forecast_periods.chg_cascadeadas_hl, 0) + $3,
         chg_pct            = CASE WHEN COALESCE(forecast_periods.sah, 0) > 0
                                   THEN ROUND((COALESCE(forecast_periods.chg_hl, 0)
                                             + COALESCE(forecast_periods.chg_sl, 0)
-                                            + COALESCE(forecast_periods.chg_cascadeadas_hl, 0) + $3
-                                            + COALESCE(forecast_periods.chg_cascadeadas_sl, 0) + $4)
-                                             / forecast_periods.sah * 100, 2)
+                                            + COALESCE(forecast_periods.chg_cascadeadas_hl, 0) + $3)
+                                             / COALESCE(forecast_periods.sah, 0) * 100, 2)
                                   ELSE 0 END,
         chg_pct_hl         = CASE WHEN COALESCE(forecast_periods.sah, 0) > 0
                                   THEN ROUND((COALESCE(forecast_periods.chg_hl, 0)
                                             + COALESCE(forecast_periods.chg_cascadeadas_hl, 0) + $3)
-                                             / forecast_periods.sah * 100, 2)
+                                             / COALESCE(forecast_periods.sah, 0) * 100, 2)
                                   ELSE 0 END,
         chg_pct_sl         = CASE WHEN COALESCE(forecast_periods.sah, 0) > 0
-                                  THEN ROUND((COALESCE(forecast_periods.chg_sl, 0)
-                                            + COALESCE(forecast_periods.chg_cascadeadas_sl, 0) + $4)
-                                             / forecast_periods.sah * 100, 2)
+                                  THEN ROUND(COALESCE(forecast_periods.chg_sl, 0)
+                                             / COALESCE(forecast_periods.sah, 0) * 100, 2)
                                   ELSE 0 END
 """
 
@@ -136,8 +136,7 @@ async def _apply_ppa_to_forecast_periods(conn, eid, from_period, to_period, hour
     """
     for period_name, sign in [(from_period, -1), (to_period, 1)]:
         delta_hl = Decimal(hours_chargeable or 0) * sign
-        delta_sl = Decimal(hours_standard or 0) * sign
-        result = await conn.execute(_UPSERT_PPA_FP, eid, period_name, delta_hl, delta_sl)
+        result = await conn.execute(_UPSERT_PPA_FP, eid, period_name, delta_hl)
         # Si no se escribio ninguna fila el total del periodo quedaria sin el PPA y la
         # aprobacion mentiria. Se corta la transaccion en vez de aprobar a medias.
         if result and result.split()[-1] == "0":
@@ -150,6 +149,31 @@ async def _apply_ppa_to_forecast_periods(conn, eid, from_period, to_period, hour
         eid=eid, from_period=from_period, to_period=to_period,
         hours_chargeable=hours_chargeable, hours_standard=hours_standard,
     )
+
+
+async def reset_all() -> dict:
+    async with db.pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("UPDATE employee_daily_hours SET chg_ppa = 0, chg_ppa_sl = 0")
+            await conn.execute("""
+                UPDATE forecast_periods SET
+                    chg                = COALESCE(chg_hl, 0) + COALESCE(chg_sl, 0),
+                    chg_pct            = CASE WHEN COALESCE(sah, 0) > 0
+                                              THEN ROUND((COALESCE(chg_hl, 0) + COALESCE(chg_sl, 0)) / sah * 100, 2)
+                                              ELSE 0 END,
+                    chg_pct_hl         = CASE WHEN COALESCE(sah, 0) > 0
+                                              THEN ROUND(COALESCE(chg_hl, 0) / sah * 100, 2)
+                                              ELSE 0 END,
+                    chg_pct_sl         = CASE WHEN COALESCE(sah, 0) > 0
+                                              THEN ROUND(COALESCE(chg_sl, 0) / sah * 100, 2)
+                                              ELSE 0 END,
+                    chg_cascadeadas_hl = 0,
+                    chg_cascadeadas_sl = 0,
+                    chg_cascadeadas    = 0
+            """)
+            await conn.execute("DELETE FROM tickets WHERE type = 'ppa'")
+            await conn.execute("DELETE FROM ppa_log")
+    return {"ok": True}
 
 
 async def get_by_id(ppa_id: str) -> dict:

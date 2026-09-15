@@ -515,8 +515,7 @@ async def _apply_approval_side_effects(conn, ticket: dict, request_id: str):
     elif t_type == "ppa":
         from app.services import ppa_service as _ppa
         from app.country import to_iso
-        hours = ticket.get("hours_to_move") or 0
-        hours_chargeable = ticket.get("hours_chargeable") or hours
+        hours_chargeable = ticket.get("hours_chargeable") or 0
         hours_standard = ticket.get("hours_standard") or 0
         from_period = ticket.get("from_period")
         to_period = ticket.get("to_period")

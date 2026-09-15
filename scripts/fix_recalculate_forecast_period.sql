@@ -9,10 +9,11 @@ DECLARE
   v_period_start   DATE;
   v_period_end     DATE;
   v_sah            NUMERIC;
+  v_sah_effective  NUMERIC;
   v_chg            NUMERIC;
   v_chg_hl         NUMERIC := 0;
   v_chg_sl         NUMERIC := 0;
-  v_ppa_adj        NUMERIC := 0;
+  v_ppa_hl_adj     NUMERIC := 0;
   v_absence_hours  NUMERIC := 0;
   v_block_count    INTEGER := 0;
 BEGIN
@@ -107,16 +108,15 @@ BEGIN
     v_chg_sl := 0;
   END IF;
 
-  -- PPA adjustment
-  SELECT COALESCE(SUM(
-    CASE WHEN to_period   = p_period_name THEN  hours
-         WHEN from_period = p_period_name THEN -hours
-         ELSE 0
-    END
-  ), 0)
-  INTO v_ppa_adj
+  -- PPA adjustment: solo HL. Las SL son estimaciones y no son movibles via PPA.
+  SELECT
+    COALESCE(SUM(CASE WHEN to_period   = p_period_name THEN  COALESCE(hours_chargeable, 0)
+                      WHEN from_period = p_period_name THEN -COALESCE(hours_chargeable, 0)
+                      ELSE 0 END), 0)
+  INTO v_ppa_hl_adj
   FROM ppa_log
   WHERE eid = p_eid
+    AND status = 'approved'
     AND (to_period = p_period_name OR from_period = p_period_name);
 
   -- Absence hours: approved absences overlapping this period
@@ -127,32 +127,40 @@ BEGIN
     AND a.start_date <= v_period_end
     AND a.end_date   >= v_period_start;
 
-  v_chg := COALESCE(v_chg_hl, 0) + COALESCE(v_chg_sl, 0) + COALESCE(v_ppa_adj, 0);
+  v_sah_effective := COALESCE(v_sah, 0);
+  v_chg := COALESCE(v_chg_hl, 0) + COALESCE(v_chg_sl, 0) + v_ppa_hl_adj;
 
   INSERT INTO forecast_periods (
     eid, period_name, chg, sah, chg_pct,
     chg_hl, chg_sl, absence_hours,
-    chg_pct_hl, chg_pct_sl
+    chg_pct_hl, chg_pct_sl,
+    chg_cascadeadas_hl, chg_cascadeadas_sl, chg_cascadeadas
   )
   VALUES (
     p_eid, p_period_name,
     v_chg,
-    COALESCE(v_sah, 0),
-    CASE WHEN COALESCE(v_sah, 0) > 0 THEN ROUND(v_chg    / v_sah * 100, 2) ELSE 0 END,
+    v_sah_effective,
+    CASE WHEN v_sah_effective > 0 THEN ROUND(v_chg / v_sah_effective * 100, 2) ELSE 0 END,
     COALESCE(v_chg_hl, 0),
     COALESCE(v_chg_sl, 0),
     COALESCE(v_absence_hours, 0),
-    CASE WHEN COALESCE(v_sah, 0) > 0 THEN ROUND(v_chg_hl / v_sah * 100, 2) ELSE 0 END,
-    CASE WHEN COALESCE(v_sah, 0) > 0 THEN ROUND(v_chg_sl / v_sah * 100, 2) ELSE 0 END
+    CASE WHEN v_sah_effective > 0 THEN ROUND((COALESCE(v_chg_hl, 0) + v_ppa_hl_adj) / v_sah_effective * 100, 2) ELSE 0 END,
+    CASE WHEN v_sah_effective > 0 THEN ROUND(COALESCE(v_chg_sl, 0) / v_sah_effective * 100, 2) ELSE 0 END,
+    v_ppa_hl_adj,
+    0,
+    v_ppa_hl_adj
   )
   ON CONFLICT (eid, period_name) DO UPDATE SET
-    chg           = EXCLUDED.chg,
-    sah           = EXCLUDED.sah,
-    chg_pct       = EXCLUDED.chg_pct,
-    chg_hl        = EXCLUDED.chg_hl,
-    chg_sl        = EXCLUDED.chg_sl,
-    absence_hours = EXCLUDED.absence_hours,
-    chg_pct_hl    = EXCLUDED.chg_pct_hl,
-    chg_pct_sl    = EXCLUDED.chg_pct_sl;
+    chg                = EXCLUDED.chg,
+    sah                = EXCLUDED.sah,
+    chg_pct            = EXCLUDED.chg_pct,
+    chg_hl             = EXCLUDED.chg_hl,
+    chg_sl             = EXCLUDED.chg_sl,
+    absence_hours      = EXCLUDED.absence_hours,
+    chg_pct_hl         = EXCLUDED.chg_pct_hl,
+    chg_pct_sl         = EXCLUDED.chg_pct_sl,
+    chg_cascadeadas_hl = EXCLUDED.chg_cascadeadas_hl,
+    chg_cascadeadas_sl = EXCLUDED.chg_cascadeadas_sl,
+    chg_cascadeadas    = EXCLUDED.chg_cascadeadas;
 END;
 $function$
