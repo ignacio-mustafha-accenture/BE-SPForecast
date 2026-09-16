@@ -24,6 +24,8 @@ async def recalculate_employee(eid: str, request_id: str = "-") -> dict:
 
             # Direct UPDATE from chargeability_blocks as fallback/override.
             # Ensures chg_pct_hl and chg_pct_sl always match actual block state.
+            # Uses fp.sah (calendar value written by stored proc, without sah_ppa_adj)
+            # so that SAH PPA adjustments don't bleed into CHG computation.
             await conn.execute(
                 """
                 WITH totals AS (
@@ -41,6 +43,27 @@ async def recalculate_employee(eid: str, request_id: str = "-") -> dict:
                     chg        = ROUND(fp.sah * (t.hl_pct + t.sl_pct) / 100.0)
                 FROM totals t
                 WHERE fp.eid = $1 AND fp.period_name = $2
+                """,
+                eid, pname,
+            )
+
+            # Re-apply SAH PPA adjustment (stored proc overwrites sah from calendar).
+            # This runs AFTER the fallback so chg_hl uses calendar sah, not adjusted sah.
+            await conn.execute(
+                """
+                UPDATE forecast_periods fp
+                SET sah        = fp.sah + COALESCE(fp.sah_ppa_adj, 0),
+                    chg_pct    = CASE WHEN fp.sah + COALESCE(fp.sah_ppa_adj, 0) > 0
+                                      THEN ROUND(fp.chg / (fp.sah + COALESCE(fp.sah_ppa_adj, 0)) * 100, 2)
+                                      ELSE 0 END,
+                    chg_pct_hl = CASE WHEN fp.sah + COALESCE(fp.sah_ppa_adj, 0) > 0
+                                      THEN ROUND((fp.chg_hl + COALESCE(fp.chg_cascadeadas_hl, 0))
+                                                 / (fp.sah + COALESCE(fp.sah_ppa_adj, 0)) * 100, 2)
+                                      ELSE 0 END,
+                    chg_pct_sl = CASE WHEN fp.sah + COALESCE(fp.sah_ppa_adj, 0) > 0
+                                      THEN ROUND(fp.chg_sl / (fp.sah + COALESCE(fp.sah_ppa_adj, 0)) * 100, 2)
+                                      ELSE 0 END
+                WHERE fp.eid = $1 AND fp.period_name = $2 AND COALESCE(fp.sah_ppa_adj, 0) != 0
                 """,
                 eid, pname,
             )
@@ -65,6 +88,24 @@ async def recalculate_period(period_name: str, request_id: str = "-") -> dict:
         start = time.monotonic()
         for e in employees:
             await conn.execute("SELECT recalculate_forecast_period($1,$2)", e["eid"], period_name)
+            await conn.execute(
+                """
+                UPDATE forecast_periods fp
+                SET sah        = fp.sah + COALESCE(fp.sah_ppa_adj, 0),
+                    chg_pct    = CASE WHEN fp.sah + COALESCE(fp.sah_ppa_adj, 0) > 0
+                                      THEN ROUND(fp.chg / (fp.sah + COALESCE(fp.sah_ppa_adj, 0)) * 100, 2)
+                                      ELSE 0 END,
+                    chg_pct_hl = CASE WHEN fp.sah + COALESCE(fp.sah_ppa_adj, 0) > 0
+                                      THEN ROUND((fp.chg_hl + COALESCE(fp.chg_cascadeadas_hl, 0))
+                                                 / (fp.sah + COALESCE(fp.sah_ppa_adj, 0)) * 100, 2)
+                                      ELSE 0 END,
+                    chg_pct_sl = CASE WHEN fp.sah + COALESCE(fp.sah_ppa_adj, 0) > 0
+                                      THEN ROUND(fp.chg_sl / (fp.sah + COALESCE(fp.sah_ppa_adj, 0)) * 100, 2)
+                                      ELSE 0 END
+                WHERE fp.eid = $1 AND fp.period_name = $2 AND COALESCE(fp.sah_ppa_adj, 0) != 0
+                """,
+                e["eid"], period_name,
+            )
 
         duration = int((time.monotonic() - start) * 1000)
         logger.bind(request_id=request_id, duration_ms=duration).info(

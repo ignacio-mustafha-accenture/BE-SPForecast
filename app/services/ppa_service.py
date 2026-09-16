@@ -46,6 +46,31 @@ async def _get_workdays(conn, period_name: str, country: str) -> list[date]:
     ]
 
 
+async def _apply_sah_to_daily_hours(conn, eid, from_period, to_period, hours_sah, country):
+    """Reparte el delta de SAH dia a dia en employee_daily_hours.sah_ppa."""
+    for period_name, sign in [(from_period, -1), (to_period, 1)]:
+        workdays = await _get_workdays(conn, period_name, country)
+        if not workdays:
+            logger.warning(f"No workdays found for period {period_name}, skipping SAH PPA distribution")
+            continue
+        n = len(workdays)
+        amounts = _distribute(Decimal(hours_sah), n)
+        await conn.executemany(
+            """
+            INSERT INTO employee_daily_hours (eid, date, sah, chg_hl, chg_sl, chg_ppa, chg_ppa_sl, sah_ppa, updated_at)
+            VALUES ($1, $2, 0, 0, 0, 0, 0, $3, NOW())
+            ON CONFLICT (eid, date) DO UPDATE SET
+                sah_ppa    = employee_daily_hours.sah_ppa + $3,
+                updated_at = NOW()
+            """,
+            [(eid, d, a * sign) for d, a in zip(workdays, amounts)],
+        )
+    logger.info(
+        "SAH PPA applied to daily hours",
+        eid=eid, from_period=from_period, to_period=to_period, hours_sah=hours_sah,
+    )
+
+
 async def _apply_ppa_to_daily_hours(conn, eid, from_period, to_period, hours_chargeable, hours_standard, country):
     """Reparte el PPA dia a dia en employee_daily_hours.
 
@@ -120,6 +145,50 @@ _UPSERT_PPA_FP = """
 """
 
 
+# Acumula el delta de SAH en forecast_periods.sah_ppa_adj y ajusta sah + pcts.
+# $1=eid, $2=period_name, $3=delta_sah
+_UPSERT_SAH_FP = """
+    INSERT INTO forecast_periods (
+        eid, period_name, chg, sah, sah_ppa_adj, chg_pct,
+        chg_hl, chg_sl, chg_cascadeadas, chg_cascadeadas_hl, chg_cascadeadas_sl,
+        absence_hours, chg_pct_hl, chg_pct_sl
+    )
+    VALUES ($1, $2, 0, $3::numeric, $3::numeric, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    ON CONFLICT (eid, period_name) DO UPDATE SET
+        sah_ppa_adj = COALESCE(forecast_periods.sah_ppa_adj, 0) + $3,
+        sah         = COALESCE(forecast_periods.sah, 0) + $3,
+        chg_pct     = CASE WHEN COALESCE(forecast_periods.sah, 0) + $3 > 0
+                           THEN ROUND(COALESCE(forecast_periods.chg, 0)
+                                      / (COALESCE(forecast_periods.sah, 0) + $3) * 100, 2)
+                           ELSE 0 END,
+        chg_pct_hl  = CASE WHEN COALESCE(forecast_periods.sah, 0) + $3 > 0
+                           THEN ROUND((COALESCE(forecast_periods.chg_hl, 0)
+                                       + COALESCE(forecast_periods.chg_cascadeadas_hl, 0))
+                                      / (COALESCE(forecast_periods.sah, 0) + $3) * 100, 2)
+                           ELSE 0 END,
+        chg_pct_sl  = CASE WHEN COALESCE(forecast_periods.sah, 0) + $3 > 0
+                           THEN ROUND(COALESCE(forecast_periods.chg_sl, 0)
+                                      / (COALESCE(forecast_periods.sah, 0) + $3) * 100, 2)
+                           ELSE 0 END
+"""
+
+
+async def _apply_sah_to_forecast_periods(conn, eid, from_period, to_period, hours_sah):
+    """Impacta el PPA de SAH en forecast_periods (sah_ppa_adj y sah)."""
+    for period_name, sign in [(from_period, -1), (to_period, 1)]:
+        delta = Decimal(hours_sah) * sign
+        result = await conn.execute(_UPSERT_SAH_FP, eid, period_name, delta)
+        if result and result.split()[-1] == "0":
+            raise ForecastException(
+                AppError.DB_ERROR,
+                f"No se pudo impactar el PPA de SAH en el periodo {period_name}",
+            )
+    logger.info(
+        "SAH PPA applied to forecast_periods",
+        eid=eid, from_period=from_period, to_period=to_period, hours_sah=hours_sah,
+    )
+
+
 async def _apply_ppa_to_forecast_periods(conn, eid, from_period, to_period, hours_chargeable, hours_standard):
     """Impacta el PPA en forecast_periods separando HL y SL.
 
@@ -154,18 +223,23 @@ async def _apply_ppa_to_forecast_periods(conn, eid, from_period, to_period, hour
 async def reset_all() -> dict:
     async with db.pool.acquire() as conn:
         async with conn.transaction():
-            await conn.execute("UPDATE employee_daily_hours SET chg_ppa = 0, chg_ppa_sl = 0")
+            await conn.execute("UPDATE employee_daily_hours SET chg_ppa = 0, chg_ppa_sl = 0, sah_ppa = 0")
             await conn.execute("""
                 UPDATE forecast_periods SET
+                    sah                = COALESCE(sah, 0) - COALESCE(sah_ppa_adj, 0),
+                    sah_ppa_adj        = 0,
                     chg                = COALESCE(chg_hl, 0) + COALESCE(chg_sl, 0),
-                    chg_pct            = CASE WHEN COALESCE(sah, 0) > 0
-                                              THEN ROUND((COALESCE(chg_hl, 0) + COALESCE(chg_sl, 0)) / sah * 100, 2)
+                    chg_pct            = CASE WHEN COALESCE(sah, 0) - COALESCE(sah_ppa_adj, 0) > 0
+                                              THEN ROUND((COALESCE(chg_hl, 0) + COALESCE(chg_sl, 0))
+                                                         / (COALESCE(sah, 0) - COALESCE(sah_ppa_adj, 0)) * 100, 2)
                                               ELSE 0 END,
-                    chg_pct_hl         = CASE WHEN COALESCE(sah, 0) > 0
-                                              THEN ROUND(COALESCE(chg_hl, 0) / sah * 100, 2)
+                    chg_pct_hl         = CASE WHEN COALESCE(sah, 0) - COALESCE(sah_ppa_adj, 0) > 0
+                                              THEN ROUND(COALESCE(chg_hl, 0)
+                                                         / (COALESCE(sah, 0) - COALESCE(sah_ppa_adj, 0)) * 100, 2)
                                               ELSE 0 END,
-                    chg_pct_sl         = CASE WHEN COALESCE(sah, 0) > 0
-                                              THEN ROUND(COALESCE(chg_sl, 0) / sah * 100, 2)
+                    chg_pct_sl         = CASE WHEN COALESCE(sah, 0) - COALESCE(sah_ppa_adj, 0) > 0
+                                              THEN ROUND(COALESCE(chg_sl, 0)
+                                                         / (COALESCE(sah, 0) - COALESCE(sah_ppa_adj, 0)) * 100, 2)
                                               ELSE 0 END,
                     chg_cascadeadas_hl = 0,
                     chg_cascadeadas_sl = 0,
@@ -181,7 +255,7 @@ async def get_by_id(ppa_id: str) -> dict:
         row = await conn.fetchrow("""
             SELECT p.id::text AS id, p.eid, e.name,
                    p.from_period AS "from", p.to_period AS "to",
-                   p.hours AS hs, p.hours_chargeable, p.hours_standard,
+                   p.hours AS hs, p.hours_chargeable, p.hours_standard, p.hours_sah,
                    p.reason, p.status, p.rejection_reason,
                    TO_CHAR(p.created_at,'DD/MM/YY') AS date,
                    p.created_by, COALESCE(uc.email, p.created_by) AS created_by_name, p.created_at,
@@ -221,7 +295,7 @@ async def list_ppa(eid=None, from_period=None, status=None, page=1, page_size=25
         rows = await conn.fetch(f"""
             SELECT p.id::text AS id, p.eid, e.name,
                    p.from_period AS "from", p.to_period AS "to",
-                   p.hours AS hs, p.hours_chargeable, p.hours_standard,
+                   p.hours AS hs, p.hours_chargeable, p.hours_standard, p.hours_sah,
                    p.reason, p.status, p.rejection_reason,
                    TO_CHAR(p.created_at,'DD/MM/YY') AS date,
                    COALESCE(e.country, e.location) AS country,
@@ -250,15 +324,15 @@ async def create(body: PPACreate, created_by: str, request_id: str) -> dict:
                 period = await conn.fetchrow("SELECT period_name FROM periods WHERE period_name=$1", period_name)
                 if not period:
                     raise ForecastException(AppError.PERIOD_NOT_FOUND, f"Periodo {period_name} no encontrado")
-            total_hours = (body.hours_chargeable or 0) + (body.hours_standard or 0)
+            total_hours = (body.hours_chargeable or 0) + (body.hours_standard or 0) + (body.hours_sah or 0)
             row = await conn.fetchrow(
                 """
-                INSERT INTO ppa_log (eid, from_period, to_period, hours, hours_chargeable, hours_standard, reason, created_at, created_by, status)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), $8, 'pending')
+                INSERT INTO ppa_log (eid, from_period, to_period, hours, hours_chargeable, hours_standard, hours_sah, reason, created_at, created_by, status)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), $9, 'pending')
                 RETURNING id::text
                 """,
                 body.eid, body.from_period, body.to_period,
-                total_hours, body.hours_chargeable, body.hours_standard,
+                total_hours, body.hours_chargeable, body.hours_standard, body.hours_sah,
                 body.reason or None, created_by or None,
             )
             ppa_log_id = row["id"]
@@ -266,11 +340,11 @@ async def create(body: PPACreate, created_by: str, request_id: str) -> dict:
                 """
                 INSERT INTO tickets (
                     type, eid, detail, status, date, created_by,
-                    hours_to_move, hours_chargeable, hours_standard,
+                    hours_to_move, hours_chargeable, hours_standard, hours_sah,
                     from_period, to_period, scenario_type
                 ) VALUES (
                     'ppa', $1, $2, 'Open', CURRENT_DATE, $3,
-                    $4, $5, $6, $7, $8, 'assumption'
+                    $4, $5, $6, $7, $8, $9, 'assumption'
                 )
                 """,
                 body.eid,
@@ -279,6 +353,7 @@ async def create(body: PPACreate, created_by: str, request_id: str) -> dict:
                 total_hours,
                 body.hours_chargeable,
                 body.hours_standard,
+                body.hours_sah,
                 body.from_period,
                 body.to_period,
             )
@@ -297,7 +372,7 @@ async def approve(ppa_id: str, approved_by: str, request_id: str) -> dict:
             ppa = await conn.fetchrow(
                 """
                 SELECT p.id, p.eid, p.from_period, p.to_period,
-                       p.hours, p.hours_chargeable, p.hours_standard, p.status,
+                       p.hours, p.hours_chargeable, p.hours_standard, p.hours_sah, p.status,
                        COALESCE(e.country, e.location) AS country
                 FROM ppa_log p LEFT JOIN employees e ON p.eid = e.eid
                 WHERE p.id = $1
@@ -317,6 +392,11 @@ async def approve(ppa_id: str, approved_by: str, request_id: str) -> dict:
                 hours_chargeable=ppa["hours_chargeable"],
                 hours_standard=ppa["hours_standard"],
             )
+            if ppa["hours_sah"]:
+                await _apply_sah_to_forecast_periods(
+                    conn, eid=ppa["eid"], from_period=ppa["from_period"],
+                    to_period=ppa["to_period"], hours_sah=ppa["hours_sah"],
+                )
             # Y despues el detalle diario, que solo consume la vista Diaria
             await _apply_ppa_to_daily_hours(
                 conn, eid=ppa["eid"], from_period=ppa["from_period"],
@@ -325,6 +405,12 @@ async def approve(ppa_id: str, approved_by: str, request_id: str) -> dict:
                 hours_standard=ppa["hours_standard"],
                 country=country,
             )
+            if ppa["hours_sah"]:
+                await _apply_sah_to_daily_hours(
+                    conn, eid=ppa["eid"], from_period=ppa["from_period"],
+                    to_period=ppa["to_period"], hours_sah=ppa["hours_sah"],
+                    country=country,
+                )
             await conn.execute(
                 "UPDATE ppa_log SET status='approved', resolved_at=NOW(), resolved_by=$1 WHERE id=$2",
                 approved_by or None, int(ppa_id),
@@ -356,7 +442,7 @@ async def reverse(ppa_id: str, reversed_by: str, request_id: str) -> dict:
             ppa = await conn.fetchrow(
                 """
                 SELECT p.id, p.eid, p.from_period, p.to_period,
-                       p.hours_chargeable, p.hours_standard, p.status,
+                       p.hours_chargeable, p.hours_standard, p.hours_sah, p.status,
                        COALESCE(e.country, e.location) AS country
                 FROM ppa_log p LEFT JOIN employees e ON p.eid = e.eid
                 WHERE p.id = $1
@@ -376,6 +462,13 @@ async def reverse(ppa_id: str, reversed_by: str, request_id: str) -> dict:
                 hours_chargeable=ppa["hours_chargeable"],
                 hours_standard=ppa["hours_standard"],
             )
+            if ppa["hours_sah"]:
+                await _apply_sah_to_forecast_periods(
+                    conn, eid=ppa["eid"],
+                    from_period=ppa["to_period"],
+                    to_period=ppa["from_period"],
+                    hours_sah=ppa["hours_sah"],
+                )
             country = to_iso(ppa["country"], ppa["country"])
             await _apply_ppa_to_daily_hours(
                 conn, eid=ppa["eid"],
@@ -385,6 +478,14 @@ async def reverse(ppa_id: str, reversed_by: str, request_id: str) -> dict:
                 hours_standard=ppa["hours_standard"],
                 country=country,
             )
+            if ppa["hours_sah"]:
+                await _apply_sah_to_daily_hours(
+                    conn, eid=ppa["eid"],
+                    from_period=ppa["to_period"],
+                    to_period=ppa["from_period"],
+                    hours_sah=ppa["hours_sah"],
+                    country=country,
+                )
             await conn.execute(
                 "UPDATE ppa_log SET status='reversed', reversed_at=NOW(), reversed_by=$1 WHERE id=$2",
                 reversed_by or None, int(ppa_id),
