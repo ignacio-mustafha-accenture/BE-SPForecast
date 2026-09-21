@@ -8,12 +8,13 @@ class PPACreate(BaseModel):
     to_period: str
     hours_chargeable: Optional[int] = None
     hours_standard: Optional[int] = None
+    hours_sah: Optional[int] = None
     reason: Optional[str] = None
 
     @model_validator(mode="after")
     def at_least_one_hours_field(self):
-        if self.hours_chargeable is None and self.hours_standard is None:
-            raise ValueError("At least one of hours_chargeable or hours_standard is required")
+        if self.hours_chargeable is None and self.hours_standard is None and self.hours_sah is None:
+            raise ValueError("At least one of hours_chargeable, hours_standard or hours_sah is required")
         return self
 
 
@@ -30,6 +31,7 @@ class PPAOut(BaseModel):
     hours: int
     hours_chargeable: Optional[int] = None
     hours_standard: Optional[int] = None
+    hours_sah: Optional[int] = None
     reason: Optional[str]
     status: str
     rejection_reason: Optional[str] = None

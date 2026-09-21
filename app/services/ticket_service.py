@@ -113,7 +113,7 @@ async def _fetch_full_ticket(conn, ticket_id: str) -> dict:
                COALESCE(e.name, u.full_name, t.created_by::text) AS "by",
                t.nj_name, t.cl, t.location, t.people_lead,
                t.client_name, t.offering_type, t.chargeability_pct,
-               t.hours_to_move, t.hours_chargeable, t.hours_standard,
+               t.hours_to_move, t.hours_chargeable, t.hours_standard, t.hours_sah,
                t.from_period, t.to_period, t.comments,
                t.start_date::text AS start_date,
                t.end_date::text AS end_date,
@@ -515,15 +515,19 @@ async def _apply_approval_side_effects(conn, ticket: dict, request_id: str):
     elif t_type == "ppa":
         from app.services import ppa_service as _ppa
         from app.country import to_iso
-        hours = ticket.get("hours_to_move") or 0
-        hours_chargeable = ticket.get("hours_chargeable") or hours
+        hours_chargeable = ticket.get("hours_chargeable") or 0
         hours_standard = ticket.get("hours_standard") or 0
+        hours_sah = ticket.get("hours_sah") or 0
         from_period = ticket.get("from_period")
         to_period = ticket.get("to_period")
         country_raw = ticket.get("eid_country")
         country = to_iso(country_raw, country_raw) if country_raw else "AR"
         await _ppa._apply_ppa_to_forecast_periods(conn, eid, from_period, to_period, hours_chargeable, hours_standard)
+        if hours_sah:
+            await _ppa._apply_sah_to_forecast_periods(conn, eid, from_period, to_period, hours_sah)
         await _ppa._apply_ppa_to_daily_hours(conn, eid, from_period, to_period, hours_chargeable, hours_standard, country)
+        if hours_sah:
+            await _ppa._apply_sah_to_daily_hours(conn, eid, from_period, to_period, hours_sah, country)
         await conn.execute(
             """
             UPDATE ppa_log SET status='approved', resolved_at=NOW(), resolved_by=$1
@@ -548,10 +552,29 @@ async def _recalculate_all_periods_for_eid(conn, eid: str, request_id: str):
         "Recalculating all periods for employee", eid=eid, count=len(periods)
     )
     for p in periods:
+        pname = p["period_name"]
         try:
-            await conn.execute("SELECT recalculate_forecast_period($1,$2)", eid, p["period_name"])
+            await conn.execute("SELECT recalculate_forecast_period($1,$2)", eid, pname)
         except Exception as e:
-            logger.bind(request_id=request_id).warning(f"Period recalculate failed | period={p['period_name']} | error={e}")
+            logger.bind(request_id=request_id).warning(f"Period recalculate failed | period={pname} | error={e}")
+        await conn.execute(
+            """
+            UPDATE forecast_periods fp
+            SET sah        = fp.sah + COALESCE(fp.sah_ppa_adj, 0),
+                chg_pct    = CASE WHEN fp.sah + COALESCE(fp.sah_ppa_adj, 0) > 0
+                                  THEN ROUND(fp.chg / (fp.sah + COALESCE(fp.sah_ppa_adj, 0)) * 100, 2)
+                                  ELSE 0 END,
+                chg_pct_hl = CASE WHEN fp.sah + COALESCE(fp.sah_ppa_adj, 0) > 0
+                                  THEN ROUND((fp.chg_hl + COALESCE(fp.chg_cascadeadas_hl, 0))
+                                             / (fp.sah + COALESCE(fp.sah_ppa_adj, 0)) * 100, 2)
+                                  ELSE 0 END,
+                chg_pct_sl = CASE WHEN fp.sah + COALESCE(fp.sah_ppa_adj, 0) > 0
+                                  THEN ROUND(fp.chg_sl / (fp.sah + COALESCE(fp.sah_ppa_adj, 0)) * 100, 2)
+                                  ELSE 0 END
+            WHERE fp.eid = $1 AND fp.period_name = $2 AND COALESCE(fp.sah_ppa_adj, 0) != 0
+            """,
+            eid, pname,
+        )
 
 
 async def update(ticket_id: int, body: TicketUpdate, request_id: str) -> dict:

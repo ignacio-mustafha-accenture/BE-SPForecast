@@ -57,3 +57,9 @@ async def reverse_ppa(ppa_id: str, request: Request):
     user = request.state.user
     actor = user.get("eid") or user.get("email")
     return await ppa_service.reverse(ppa_id, actor, request.state.request_id)
+
+
+@router.delete("", dependencies=[require_permission("admin:sync")])
+async def reset_all_ppa(request: Request):
+    request.state.action = "Reset all PPAs"
+    return await ppa_service.reset_all()
