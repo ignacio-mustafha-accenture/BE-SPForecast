@@ -234,6 +234,7 @@ async def get_state(window_offset: int = 0) -> dict:
                 COALESCE(fp.chg_hl, 0) + COALESCE(fp.chg_sl, 0)                    AS chg_neto,
                 COALESCE(fp.chg_hl, 0) + COALESCE(fp.chg_sl, 0)
                   + COALESCE(fp.chg_cascadeadas_hl, 0)                              AS chg,
+                COALESCE(fp.sah_ppa_adj, 0)                                         AS sah_ppa_adj,
                 COALESCE(fp.absence_hours, 0)                                       AS absence_hours,
                 CASE WHEN COALESCE(fp.sah, 0) > 0
                      THEN ROUND((COALESCE(fp.chg_hl, 0) + COALESCE(fp.chg_cascadeadas_hl, 0))
@@ -277,6 +278,7 @@ async def get_state(window_offset: int = 0) -> dict:
                 "chg_cascadeadas":    float(fp["chg_cascadeadas"] or 0),
                 "chg_cascadeadas_hl": float(fp["chg_cascadeadas_hl"] or 0),
                 "chg_cascadeadas_sl": float(fp["chg_cascadeadas_sl"] or 0),
+                "sah_ppa_adj":        float(fp["sah_ppa_adj"] or 0),
                 "absence_hours":      float(fp["absence_hours"] or 0),
                 "chg_pct_sl":         float(fp["chg_pct_sl"] or 0),
                 "chg_pct_hl":         float(fp["chg_pct_hl"] or 0),
@@ -297,6 +299,7 @@ async def get_state(window_offset: int = 0) -> dict:
             absence_hours_arr      = [float(fp.get(pn, {}).get("absence_hours", 0))      for pn in period_names]
             chg_pct_sl_arr         = [float(fp.get(pn, {}).get("chg_pct_sl", 0))         for pn in period_names]
             chg_pct_hl_arr         = [float(fp.get(pn, {}).get("chg_pct_hl", 0))         for pn in period_names]
+            sah_ppa_adj_arr        = [float(fp.get(pn, {}).get("sah_ppa_adj", 0))        for pn in period_names]
 
             ak = kind_map.get(row["EID"], {})
             assumption_kind_arr = [ak.get(pn) for pn in period_names]
@@ -329,6 +332,7 @@ async def get_state(window_offset: int = 0) -> dict:
                 "absence_hours":      absence_hours_arr,
                 "chg_pct_sl":         chg_pct_sl_arr,
                 "chg_pct_hl":         chg_pct_hl_arr,
+                "sah_ppa_adj":        sah_ppa_adj_arr,
                 "assumption_kind":    assumption_kind_arr,
                 "NJFormat": (
                     f"{row['Name']} | {row['HireDate']} | CL{row['CL']} | {row['Country']}"
