@@ -49,6 +49,19 @@ async def forecast_handler(request: Request, exc: ForecastException):
     )
 
 
+def _serialize_errors(errors: list) -> list:
+    result = []
+    for err in errors:
+        e = dict(err)
+        if "ctx" in e and isinstance(e["ctx"], dict):
+            e["ctx"] = {
+                k: str(v) if isinstance(v, Exception) else v
+                for k, v in e["ctx"].items()
+            }
+        result.append(e)
+    return result
+
+
 @app.exception_handler(RequestValidationError)
 async def validation_handler(request: Request, exc: RequestValidationError):
     try:
@@ -56,15 +69,16 @@ async def validation_handler(request: Request, exc: RequestValidationError):
         body_text = body.decode("utf-8", errors="replace")
     except Exception:
         body_text = "<unreadable>"
+    errors = _serialize_errors(exc.errors())
     logger.warning(
         "422 Validation error | path={} | errors={} | body={}",
         request.url.path,
-        exc.errors(),
+        errors,
         body_text,
     )
     return JSONResponse(
         status_code=422,
-        content={"code": AppError.VALIDATION_ERROR.code, "detail": exc.errors()},
+        content={"code": AppError.VALIDATION_ERROR.code, "detail": errors},
     )
 
 
