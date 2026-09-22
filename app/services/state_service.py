@@ -162,6 +162,7 @@ async def get_state(window_offset: int = 0) -> dict:
                 COALESCE(pl.name, e.people_lead::text) AS "Manager",
                 COALESCE(te.name, fu.te_approver::text) AS "TEApprover",
                 fu.offering AS "ProjectType",
+                e.offering AS "EmployeeOffering",
                 fu.client AS "Client",
                 COALESCE(am.name, fu.account_manager::text) AS "AccountManager",
                 fu.office AS "Office",
