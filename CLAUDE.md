@@ -6,11 +6,11 @@ Internal capacity and chargeability management app for Accenture S&P Delivery (A
 
 - **Python 3.14** + **FastAPI** with `asynccontextmanager` lifespan
 - **asyncpg** — raw parameterized SQL, no ORM, `$1/$2` style params
-- **pydantic-settings** `BaseSettings` for config (`extra="ignore"` to allow Supabase vars)
+- **pydantic-settings** `BaseSettings` for config (`extra="ignore"` to allow extra env vars)
 - **loguru** — JSON logging in prod, text in dev; `request_id` propagated via `contextualize`
 - **python-jose** — JWT, HS256, stored in HttpOnly cookie (`access_token`, SameSite=Lax, 8h TTL)
 - **bcrypt** — password hashing directly (NOT passlib — incompatible with bcrypt 5.x)
-- **Supabase PostgreSQL** — hosted DB, Session pooler (IPv4, `aws-0-us-east-1.pooler.supabase.com:5432`), SSL required
+- **Azure PostgreSQL** — hosted DB (`*.postgres.database.azure.com:5432`), SSL required. Supabase solo se usa en scripts de migración (`SUPABASE_DB_*` vars)
 
 ## Running locally
 
@@ -309,10 +309,19 @@ Permissions are resolved in order:
 - `users` — app users with `role` (admin/manager/viewer), `hashed_password`, optional `eid` link
 - `audit_log` — immutable request log (method, path, status, duration, user_id)
 
+## Versioning
+
+On every deploy, bump the version in `FE-SPForecast/package.json` using semver:
+- **patch** (`0.x.Y`) — bug fixes, minor UI tweaks
+- **minor** (`0.X.0`) — new features or screens
+- **major** (`X.0.0`) — breaking changes or full redesigns
+
+The version is displayed in the navbar user menu dropdown (`UserMenu.tsx` reads it from `package.json`).
+
 ## Known issues / gotchas
 
-- `\restrict` line in pg_dump exports from Supabase — strip before running in SQL Editor
-- Supabase direct connection (`db.*.supabase.co`) only has AAAA (IPv6) — use Session pooler on Windows
+- VPN corporativa bloquea la conexión a Azure PostgreSQL — desconectarse antes de correr el backend localmente
+- `\restrict` line in pg_dump exports from Supabase — strip antes de correr en SQL Editor (solo relevante para scripts de migración)
 - asyncpg Session pooler needs `ssl="require"` — do not remove
 - Self-referential FK on `employees.people_lead` — insert with NULL first, then UPDATE
 - `recalculate_forecast_period(eid, period_name)` stored proc must be called sequentially (never parallel)

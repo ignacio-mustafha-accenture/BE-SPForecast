@@ -219,21 +219,40 @@ async def create(body: TicketCreate, created_by: str, request_id: str) -> dict:
                             logger.bind(request_id=request_id).warning("Employee not found", eid=body.eid)
                             raise ForecastException(AppError.EMPLOYEE_NOT_FOUND)
 
+                    if body.type == "nj":
+                        if body.people_lead:
+                            pl = await conn.fetchrow(
+                                "SELECT eid, cl FROM employees WHERE eid=$1 AND active=TRUE", body.people_lead
+                            )
+                            if not pl:
+                                raise ForecastException(AppError.EMPLOYEE_NOT_FOUND)
+                            if pl["cl"] is not None and body.cl is not None and int(float(str(pl["cl"]))) >= int(body.cl):
+                                raise ForecastException(AppError.VALIDATION_ERROR, "people_lead debe tener CL menor al del NJ")
+
+                        if body.te_approver:
+                            ta = await conn.fetchrow(
+                                "SELECT eid, cl FROM employees WHERE eid=$1 AND active=TRUE", body.te_approver
+                            )
+                            if not ta:
+                                raise ForecastException(AppError.EMPLOYEE_NOT_FOUND)
+                            if ta["cl"] is None or int(float(str(ta["cl"]))) > 7:
+                                raise ForecastException(AppError.VALIDATION_ERROR, "te_approver debe ser manager (CL ≤ 7)")
+
                     ticket_row = await conn.fetchrow(
                         """
                         INSERT INTO tickets (
                             type, eid, detail, status, date, created_by,
-                            nj_name, start_date, end_date, cl, location, people_lead,
+                            nj_name, start_date, end_date, cl, location, people_lead, te_approver,
                             client_name, offering_type, chargeability_pct,
                             hours_to_move, from_period, to_period, comments,
                             scenario_type, effectivization_date
                         ) VALUES ($1,$2,$3,$4,CURRENT_DATE,$5,$6,$7::text::date,$8::text::date,
-                                  $9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20::text::date)
+                                  $9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21::text::date)
                         RETURNING id::text
                         """,
                         body.type, body.eid or None, body.detail, body.status, created_by or None,
                         body.nj_name or None, body.start_date or None, effective_end_date or None,
-                        body.cl, body.location or None, body.people_lead or None,
+                        body.cl, body.location or None, body.people_lead or None, body.te_approver or None,
                         body.client_name or None, body.offering_type or None,
                         body.chargeability_pct, body.hours_to_move, body.from_period or None,
                         body.to_period or None, body.comments or None,
