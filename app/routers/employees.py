@@ -31,6 +31,25 @@ async def employees_on_pto(request: Request):
     return await employee_service.get_employees_on_pto()
 
 
+@router.get("/unassigned", dependencies=[require_permission("state:read")])
+async def employees_unassigned(
+    request: Request,
+    country: str | None = Query(None),
+    cl: str | None = Query(None),
+    offering: str | None = Query(None),
+    q: str | None = Query(None),
+    group: str | None = Query(None, pattern="^(unassigned|mes_actual|mes1|mes2)$"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(25, ge=1, le=200),
+    sort: str | None = Query(None, pattern="^(name|country|level|client|roll_off|days)$"),
+    dir: str = Query("asc", pattern="^(asc|desc)$"),
+):
+    request.state.action = "List unassigned employees"
+    return await employee_service.list_unassigned(
+        country, cl, offering, q, group, page, page_size, sort, dir,
+    )
+
+
 # Se declara antes de /{eid} para que no lo capture el path param
 @router.get("/totals", dependencies=[require_permission("state:read")])
 async def employee_totals(

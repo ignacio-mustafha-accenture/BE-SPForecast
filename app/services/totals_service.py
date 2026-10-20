@@ -12,7 +12,7 @@ COUNTRY_ROWS = [
     ("MX", "Total S&P Mexico"),
     ("CR", "Total S&P Costa Rica"),
 ]
-AR_OFFERING_ROWS = ["SO", "PR", "Tools", "S4", "Ariba", "Oracle"]
+AR_OFFERING_ROWS = ["SO", "PR", "Tools", "S4", "Ariba", "Oracle", "SAP"]
 
 # employees.country / location no esta normalizado: convive el nombre completo con el codigo
 COUNTRY_CODE_SQL = """
@@ -84,6 +84,7 @@ async def get_totals(
     conditions, filter_params = employee_service.build_employee_filters(
         country, cl, q, status,
         offering=offering, te_approver=te_approver, chg_bucket=chg_bucket,
+        include_departed=True,
     )
     where = " AND ".join(conditions)
 
@@ -102,8 +103,10 @@ async def get_totals(
         filtered AS (
             SELECT
                 e.eid,
+                e.active AS is_active,
+                e.termination_date AS term_date,
                 {COUNTRY_CODE_SQL} AS country_code,
-                COALESCE(NULLIF(TRIM(fu.offering), ''), 'SIN OFFERING') AS offering
+                COALESCE(NULLIF(TRIM(e.offering), ''), NULLIF(TRIM(fu.offering), ''), 'SIN OFFERING') AS offering
             FROM employees e
             LEFT JOIN latest_fu fu ON e.eid = fu.eid
             LEFT JOIN fp_cur ON fp_cur.eid = e.eid
@@ -134,6 +137,8 @@ async def get_totals(
                     SELECT
                         fp.eid,
                         fp.period_name,
+                        (SELECT MIN(p.start_date) FROM periods p
+                          WHERE p.period_name = fp.period_name)         AS period_start,
                         COALESCE(fp.sah, 0)                             AS sah,
                         COALESCE(fp.chg_hl, 0)                          AS chg_hl,
                         COALESCE(fp.chg_sl, 0)                          AS chg_sl,
@@ -153,7 +158,10 @@ async def get_totals(
                     SUM(h.chg_neto) AS chg_neto,
                     SUM(h.chg)      AS chg
                 FROM filtered f
+                -- Un empleado dado de baja cuenta en los periodos que empiezan hasta su
+                -- termination_date: la baja no cambia los periodos anteriores.
                 JOIN hours h ON h.eid = f.eid
+                             AND (f.is_active OR h.period_start <= f.term_date)
                 GROUP BY f.country_code, f.offering, h.period_name
             """, *hours_params)
 
@@ -161,6 +169,7 @@ async def get_totals(
                 {filtered_cte}
                 SELECT country_code, offering, COUNT(*) AS hc
                 FROM filtered
+                WHERE is_active  -- el headcount es el actual: los dados de baja no suman
                 GROUP BY country_code, offering
             """, *filter_params)
 

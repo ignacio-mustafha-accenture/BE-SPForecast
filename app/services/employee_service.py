@@ -15,6 +15,7 @@ def build_employee_filters(
     offering: str | None = None,
     te_approver: str | None = None,
     chg_bucket: str | None = None,
+    include_departed: bool = False,
 ) -> tuple[list[str], list]:
     """Arma las condiciones WHERE que comparten el listado de empleados y los totales.
 
@@ -25,7 +26,10 @@ def build_employee_filters(
     La query que consuma estas condiciones tiene que exponer los alias 'e' (employees),
     'fu' (ultimo forecast_update) y 'fp_cur' (forecast del periodo actual).
     """
-    conditions = ["e.active = TRUE"]
+    # include_departed=True suma a los inactivos con termination_date: los totales los
+    # cuentan en los periodos hasta su baja (ver totals_service). El listado no lo usa.
+    conditions = ["(e.active = TRUE OR e.termination_date IS NOT NULL)"
+                  if include_departed else "e.active = TRUE"]
     params: list = []
 
     if country:
@@ -63,7 +67,9 @@ def build_employee_filters(
 
     if offering:
         params.append(offering)
-        conditions.append(f"fu.offering = ${len(params)}")
+        conditions.append(
+            f"COALESCE(NULLIF(TRIM(e.offering),''), NULLIF(TRIM(fu.offering),'')) = ${len(params)}"
+        )
 
     if te_approver:
         params.append(f"%{te_approver}%")
@@ -235,6 +241,153 @@ async def list_employees(
 
     pages = -(-total // page_size) if page_size > 0 else 0
     return {"items": employees, "total": total, "page": page, "page_size": page_size, "pages": pages}
+
+
+UNASSIGNED_GROUPS = ("unassigned", "mes_actual", "mes1", "mes2")
+
+# Whitelist de orden: clave publica -> expresion SQL (sobre el CTE 'base')
+_UNASSIGNED_SORT = {
+    "name": "name",
+    "country": "country",
+    "level": "level_num",
+    "client": "client",
+    "roll_off": "roll_off",
+    "days": "days",
+}
+
+# Base compartida: calcula eff_days (misma formula que state_service) y el grupo
+_UNASSIGNED_BASE = """
+    WITH latest_fu AS (
+        SELECT DISTINCT ON (eid) * FROM forecast_update ORDER BY eid, updated_at DESC NULLS LAST
+    ),
+    base AS (
+        SELECT
+            e.eid, e.name,
+            COALESCE(e.country, e.location) AS country,
+            CAST(e.cl AS NUMERIC) AS level_num,
+            COALESCE(pl.name, e.people_lead::text) AS manager,
+            fu.client AS client,
+            fu.roll_off AS roll_off,
+            fu.first_available AS fad,
+            e.charge AS charge,
+            CASE WHEN fu.roll_off IS NULL THEN NULL
+                 WHEN fu.roll_off <= CURRENT_DATE THEN 0
+                 ELSE fu.roll_off - CURRENT_DATE END AS eff_days
+        FROM employees e
+        LEFT JOIN latest_fu fu ON e.eid = fu.eid
+        LEFT JOIN employees pl ON e.people_lead = pl.eid
+        WHERE {where}
+          AND (e.termination_date IS NULL OR e.termination_date > CURRENT_DATE)
+    ),
+    grouped AS (
+        SELECT *,
+            CASE
+                WHEN charge IS FALSE
+                  OR client IS NULL OR TRIM(client) = '' OR LOWER(TRIM(client)) = 'unassigned'
+                  OR eff_days = 0 THEN 'unassigned'
+                WHEN roll_off IS NULL THEN NULL
+                ELSE CASE (EXTRACT(YEAR FROM roll_off) - EXTRACT(YEAR FROM CURRENT_DATE)) * 12
+                          + (EXTRACT(MONTH FROM roll_off) - EXTRACT(MONTH FROM CURRENT_DATE))
+                    WHEN 0 THEN 'mes_actual'
+                    WHEN 1 THEN 'mes1'
+                    WHEN 2 THEN 'mes2'
+                    ELSE NULL END
+            END AS grp
+        FROM base
+    ),
+    final AS (
+        SELECT *,
+            CASE WHEN grp = 'unassigned'
+                 THEN CASE WHEN roll_off IS NULL THEN NULL
+                           ELSE GREATEST(CURRENT_DATE - roll_off, 0) END
+                 ELSE eff_days END AS days
+        FROM grouped
+        WHERE grp IS NOT NULL
+    )
+"""
+
+
+async def list_unassigned(
+    country: str | None,
+    cl: str | None,
+    offering: str | None,
+    q: str | None,
+    group: str | None,
+    page: int,
+    page_size: int,
+    sort: str | None,
+    direction: str,
+) -> dict:
+    conditions, params = build_employee_filters(country, cl, q, None, offering=offering)
+    base_sql = _UNASSIGNED_BASE.format(where=" AND ".join(conditions))
+
+    order_dir = "DESC" if direction == "desc" else "ASC"
+    sort_col = _UNASSIGNED_SORT.get(sort or "")
+    # Primero los ya desasignados, del que lleva mas dias sin asignacion al que se desasigno
+    # hoy (sin fecha al final); despues los proximos, del que falta menos al que falta mas.
+    grp_key = "CASE WHEN grp = 'unassigned' THEN 0 ELSE 1 END"
+    days_key = "CASE WHEN grp = 'unassigned' THEN -COALESCE(days, -1) + CASE WHEN days IS NULL THEN 2 ELSE 0 END ELSE COALESCE(days, 0) END"
+    soonest = f"{grp_key}, {days_key}, name ASC"
+    latest = f"{grp_key} DESC, {days_key} DESC, name ASC"
+    if sort in ("days", "roll_off"):
+        order_by = latest if direction == "desc" else soonest
+    elif sort_col:
+        order_by = f"{sort_col} {order_dir} NULLS LAST, name ASC"
+    else:
+        order_by = soonest
+
+    list_params = list(params)
+    group_cond = ""
+    if group:
+        list_params.append(group)
+        group_cond = f"WHERE grp = ${len(list_params)}"
+    list_params.append(page_size)
+    limit_idx = len(list_params)
+    list_params.append((page - 1) * page_size)
+    offset_idx = len(list_params)
+
+    async with db.pool.acquire() as conn:
+        rows = await conn.fetch(f"""
+            {base_sql}
+            SELECT
+                eid AS "EID",
+                name AS "Name",
+                country AS "Country",
+                CASE WHEN level_num IS NOT NULL THEN CAST(level_num AS INTEGER)::text END AS "CL",
+                client AS "Client",
+                manager AS "Manager",
+                TO_CHAR(roll_off,'DD/MM/YY') AS "RollOff",
+                TO_CHAR(fad,'DD/MM/YY') AS "FAD",
+                eff_days AS "DaysToAvailable",
+                days AS "Days",
+                grp AS "Group",
+                COUNT(*) OVER () AS _total
+            FROM final
+            {group_cond}
+            ORDER BY {order_by}
+            LIMIT ${limit_idx} OFFSET ${offset_idx}
+        """, *list_params)
+        # Conteos por grupo con los mismos filtros, ignorando 'group'
+        count_rows = await conn.fetch(
+            f"{base_sql} SELECT grp, COUNT(*) AS n FROM final GROUP BY grp", *params
+        )
+
+    total = int(rows[0]["_total"]) if rows else 0
+    items = []
+    for r in rows:
+        row = dict(r)
+        row.pop("_total", None)
+        items.append(row)
+
+    counts = {g: 0 for g in UNASSIGNED_GROUPS}
+    for r in count_rows:
+        counts[r["grp"]] = int(r["n"])
+
+    pages = -(-total // page_size) if page_size > 0 else 0
+    return {
+        "items": items, "total": total, "page": page, "page_size": page_size,
+        "pages": pages, "counts": counts,
+    }
 
 
 async def get_employees_on_pto() -> list:

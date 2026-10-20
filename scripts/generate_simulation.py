@@ -10,6 +10,7 @@ Usage:
 """
 
 import argparse
+import calendar as _calendar
 import csv
 import json
 import os
@@ -38,6 +39,56 @@ MONTH_MAP = {
 }
 
 SPECIAL_CLIENTS = {"", "out", "licencia", "nj", "sl", "loa"}
+
+MONTH_ABBR_TO_NUM = {
+    "Jul": 7, "Ago": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dic": 12,
+    "Ene": 1, "Feb": 2, "Mar": 3, "Abr": 4, "May": 5, "Jun": 6,
+}
+
+
+def period_date_range(pname):
+    """Return (start_date, end_date) for a period name like 'Jul-P1' or 'Ene-P1-27'."""
+    m = re.match(r'^([A-Za-z]+)-(P[12])(?:-(\d{2}))?$', pname)
+    if not m:
+        return None, None
+    mon_abbr, phalf, yr_suffix = m.groups()
+    mon_num = MONTH_ABBR_TO_NUM.get(mon_abbr)
+    if not mon_num:
+        return None, None
+    year = 2000 + int(yr_suffix) if yr_suffix else 2026
+    if phalf == 'P1':
+        return date(year, mon_num, 1), date(year, mon_num, 15)
+    else:
+        _, last_day = _calendar.monthrange(year, mon_num)
+        return date(year, mon_num, 16), date(year, mon_num, last_day)
+
+
+def date_to_period(d, period_ranges):
+    """Return the period name that contains date d, or None."""
+    for pname, start, end in period_ranges:
+        if start <= d <= end:
+            return pname
+    return None
+
+
+def enrich_ptos_with_periods(employees, period_order):
+    """Assign period_name to date-based PTOs and flag suspicious n_days."""
+    ranges = [(p, *period_date_range(p)) for p in period_order]
+    ranges = [(p, s, e) for p, s, e in ranges if s]
+
+    for emp in employees:
+        for pto in emp["ptos"]:
+            if pto.get("start_date") and not pto.get("period_name"):
+                try:
+                    d = date.fromisoformat(pto["start_date"])
+                    pto["period_name"] = date_to_period(d, ranges)
+                    # Flag if n_days suspiciously large (likely date-format bug)
+                    pto["suspicious"] = pto["n_days"] > 45
+                except (ValueError, TypeError):
+                    pass
+            else:
+                pto.setdefault("suspicious", False)
+    return employees
 
 # Offerings ya existentes en la DB (import_offerings_clients.py::VALID_OFFERINGS)
 KNOWN_OFFERINGS = {"SO", "PR", "Tools", "S4", "Ariba", "Oracle"}
@@ -382,6 +433,22 @@ def _parse_comma_or_dash_list(text, no_ticket, ptos, unparsed):
                 })
                 parsed_any = True
                 continue
+        # Try to extract date from beginning of token: "10/1 Día de mudanza" → Oct 1
+        date_prefix = re.match(r'^(\d{1,2}/\d{1,2}(?:/\d{2,4})?)\s+', token)
+        if date_prefix:
+            date_part = date_prefix.group(1)
+            label = token[date_prefix.end():].strip()
+            d = parse_pto_md(date_part) or parse_date_str(date_part)
+            if d:
+                ptos.append({
+                    "start_date": d.isoformat(),
+                    "end_date": d.isoformat(),
+                    "n_days": 1,
+                    "no_ticket": no_ticket,
+                    "label": label,
+                })
+                parsed_any = True
+                continue
         # Could not parse
         if token and not INFORMAL_PTO_KEYWORDS.search(token):
             unparsed.append(token)
@@ -522,6 +589,14 @@ def parse_format_b(comment, eid):
         pf = pto_field.strip()
         if re.match(r"^\d{2}/\d{2}/\d{4}$", pf):
             result["roll_off"] = parse_date_str(pf)
+            # 5-field format: CHG%|cliente|roll_on|roll_off|PTO
+            # Field 5+ is the actual PTO info — previously silently ignored
+            if len(parts) > 4:
+                pto5 = "|".join(p.strip() for p in parts[4:]).strip()
+                if pto5 and pto5 != "-":
+                    ptos, unp = parse_pto_b(pto5, eid)
+                    result["ptos"].extend(ptos)
+                    result["unparsed_segments"].extend(unp)
         elif pf and pf != "-":
             ptos, unp = parse_pto_b(pto_field, eid)
             result["ptos"].extend(ptos)
@@ -732,6 +807,55 @@ def compute_catalog_preview(employees):
     return offerings, clients
 
 
+def compute_offering_aggregates(employees, period_order):
+    """
+    Returns list of {offering, total_hc, periods: [{period_name, headcount, sah, chg_hl, chg_sl, chg, chg_pct}]}
+    aggregated by main_skill per period — mirrors the "Totales de cargabilidad" block in AllView.
+    """
+    agg = {}
+    for emp in employees:
+        offering = emp.get("main_skill") or emp.get("offering") or "—"
+        if offering not in agg:
+            agg[offering] = {p: {"headcount": 0, "sah": 0.0, "chg_hl": 0.0, "chg_sl": 0.0, "chg": 0.0}
+                             for p in period_order}
+        for pname, pdata in emp["periods"].items():
+            if pname not in agg[offering]:
+                continue
+            if pdata["sah"] > 0 or pdata["chg"] > 0:
+                agg[offering][pname]["headcount"] += 1
+                agg[offering][pname]["sah"]    += pdata["sah"]
+                agg[offering][pname]["chg_hl"] += pdata["chg_hl"]
+                agg[offering][pname]["chg_sl"] += pdata["chg_sl"]
+                agg[offering][pname]["chg"]    += pdata["chg"]
+
+    result = []
+    for offering in sorted(agg.keys()):
+        periods_list = []
+        max_hc = 0
+        for p in period_order:
+            a = agg[offering][p]
+            sah = a["sah"]
+            chg_pct = round(a["chg"] / sah * 100, 1) if sah > 0 else 0.0
+            hc = a["headcount"]
+            if hc > max_hc:
+                max_hc = hc
+            periods_list.append({
+                "period_name": p,
+                "headcount":   hc,
+                "sah":         round(sah, 1),
+                "chg_hl":      round(a["chg_hl"], 1),
+                "chg_sl":      round(a["chg_sl"], 1),
+                "chg":         round(a["chg"], 1),
+                "chg_pct":     chg_pct,
+            })
+        result.append({
+            "offering":  offering,
+            "total_hc":  max_hc,
+            "periods":   periods_list,
+        })
+    return result
+
+
 def compute_summary(employees, issues):
     total = len(employees)
     active = sum(1 for e in employees if e["status"] == "Active")
@@ -849,6 +973,8 @@ tr.detail-row.hidden { display:none; }
   <div class="meta" id="meta-bar"></div>
 </div>
 <div class="container">
+  <div id="offering-summary-section" style="margin-bottom:24px"></div>
+
   <div class="cards" id="summary-cards"></div>
 
   <div class="section-header">
@@ -908,6 +1034,8 @@ tr.detail-row.hidden { display:none; }
     </div>
     <div id="period-table-container"></div>
   </div>
+
+  <div id="pto-migration-section" style="margin-top:32px"></div>
 
   <div class="issues-section" id="issues-section"></div>
 </div>
@@ -1030,8 +1158,13 @@ function renderDetail(emp) {
               ? fmtDate(p.start_date)
               : fmtDate(p.start_date) + ' → ' + fmtDate(p.end_date))
           : pname || '?';
+        const periodTag = p.period_name && p.start_date
+          ? `<span style="font-size:10px;background:#ede9fe;color:#5b21b6;padding:1px 4px;border-radius:3px;margin-left:4px">${p.period_name}</span>`
+          : '';
+        const labelTag = p.label ? `<em style="font-size:10px;color:var(--muted);margin-left:4px">${escHtml(p.label)}</em>` : '';
+        const suspWarn = p.suspicious ? '<span style="color:#dc2626;margin-left:4px" title="Verificar formato de fecha">⚠</span>' : '';
         const ticket = p.no_ticket ? '<span class="no-ticket">[sin ticket]</span>' : '';
-        return `<li><span>${range}</span><span>${p.n_days}d</span>${ticket}</li>`;
+        return `<li><span>${range}${periodTag}${labelTag}${suspWarn}</span><span>${p.n_days}d</span>${ticket}</li>`;
       }).join('')}
     </ul>`;
   }
@@ -1130,11 +1263,89 @@ function renderPeriodSummary() {
   if (!inp) return;
   inp.value = DATA.target_pct;
   document.getElementById('period-table-container').innerHTML = renderPeriodTable(DATA.target_pct);
+  renderOfferingSummary(DATA.target_pct);
 
   inp.addEventListener('input', () => {
     const t = parseFloat(inp.value) || DATA.target_pct;
     document.getElementById('period-table-container').innerHTML = renderPeriodTable(t);
+    renderOfferingSummary(t);
   });
+}
+
+// ─── offering summary (cargabilidad SP por offering) ────────────────────────
+function renderOfferingSummary(target) {
+  const el = document.getElementById('offering-summary-section');
+  if (!el || !DATA.offering_agg || DATA.offering_agg.length === 0) return;
+
+  const periods = PERIODS;
+
+  const periodHeaders = periods.map(p =>
+    `<th style="text-align:center;white-space:nowrap;padding:8px 10px">${p}</th>`
+  ).join('');
+
+  function pctCell(p, bold) {
+    if (!p || p.sah === 0) return '<td style="text-align:center;color:#ccc">—</td>';
+    const actual = p.chg_pct;
+    const aboveTarget = actual >= target;
+    const color = aboveTarget ? '#15803d' : actual >= target * 0.9 ? '#d97706' : '#dc2626';
+    const arrow = aboveTarget ? '▲' : '▼';
+    const fw = bold ? '700' : '600';
+    return `<td style="text-align:center" title="CHG: ${p.chg}h / SAH: ${p.sah}h / HL: ${p.chg_hl}h / SL: ${p.chg_sl}h">
+      <span style="color:${color};font-weight:${fw};font-size:12px">${arrow} ${actual}%</span>
+    </td>`;
+  }
+
+  const rows = DATA.offering_agg.map(row => {
+    const cells = row.periods.map(p => pctCell(p, false)).join('');
+    return `<tr>
+      <td style="font-weight:600;padding:7px 12px">${escHtml(row.offering)}</td>
+      <td style="text-align:center;padding:7px 8px">${row.total_hc}</td>
+      ${cells}
+    </tr>`;
+  }).join('');
+
+  // Total row: sum CHG and SAH per period across all offerings
+  const totalCells = periods.map((p, i) => {
+    let totChg = 0, totSah = 0, totHl = 0, totSl = 0;
+    for (const row of DATA.offering_agg) {
+      const pd = row.periods[i];
+      if (pd) { totChg += pd.chg; totSah += pd.sah; totHl += pd.chg_hl; totSl += pd.chg_sl; }
+    }
+    if (totSah === 0) return '<td style="text-align:center;color:#ccc">—</td>';
+    const pct = (totChg / totSah * 100).toFixed(1);
+    const fakeP = { chg_pct: parseFloat(pct), sah: totSah, chg: totChg, chg_hl: totHl, chg_sl: totSl };
+    return pctCell(fakeP, true);
+  }).join('');
+
+  const totalHc = DATA.offering_agg.reduce((s, r) => s + r.total_hc, 0);
+
+  el.innerHTML = `
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
+      <h2 style="margin:0">Cargabilidad total SP por Offering</h2>
+    </div>
+    <p style="font-size:12px;color:var(--muted);margin-bottom:12px">
+      CHG Neto = CHG HL + CHG SL &nbsp;&#124;&nbsp; ▲ verde = sobre target &nbsp;&#124;&nbsp; Hover sobre celda para ver horas
+    </p>
+    <div class="table-wrap" style="overflow-x:auto">
+      <table>
+        <thead>
+          <tr>
+            <th style="text-align:left">Offering</th>
+            <th style="text-align:center">HC</th>
+            ${periodHeaders}
+          </tr>
+        </thead>
+        <tbody>
+          ${rows}
+          <tr style="border-top:2px solid var(--border);background:#f3f4f6">
+            <td style="font-weight:700;padding:7px 12px">TOTAL SP</td>
+            <td style="text-align:center;font-weight:700;padding:7px 8px">${totalHc}</td>
+            ${totalCells}
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  `;
 }
 
 // ─── catalog section ────────────────────────────────────────────────────────
@@ -1186,6 +1397,112 @@ function renderCatalog() {
         </table>
       </div>
     </div>
+  `;
+}
+
+// ─── PTO migration guide ─────────────────────────────────────────────────────
+function ptoRangeStr(p) {
+  if (p.start_date) {
+    const range = p.start_date === p.end_date
+      ? fmtDate(p.start_date)
+      : fmtDate(p.start_date) + ' → ' + fmtDate(p.end_date);
+    return range;
+  }
+  return `período ${p.period_name || '?'}`;
+}
+
+function ptoPeriodTag(p) {
+  if (!p.period_name) return '';
+  return ` <span style="font-size:10px;background:#ede9fe;color:#5b21b6;padding:1px 5px;border-radius:3px">${p.period_name}</span>`;
+}
+
+function renderPtoMigration() {
+  const el = document.getElementById('pto-migration-section');
+  if (!el) return;
+
+  const empWithPtos = DATA.employees.filter(e => e.ptos.length > 0 || e.unparsed_segments.length > 0);
+  let totalDateBased = 0, totalPeriodBased = 0, totalUnparsed = 0, totalSuspicious = 0;
+  for (const e of DATA.employees) {
+    for (const p of e.ptos) {
+      p.start_date ? totalDateBased++ : totalPeriodBased++;
+      if (p.suspicious) totalSuspicious++;
+    }
+    totalUnparsed += e.unparsed_segments.length;
+  }
+  const totalPtos = totalDateBased + totalPeriodBased;
+
+  // Flat table of ALL individual PTOs (one row per PTO)
+  const allPtoRows = [];
+  for (const emp of empWithPtos) {
+    for (const p of emp.ptos) {
+      const isDate = !!p.start_date;
+      const periodo = p.period_name || (isDate ? '—' : p.period_name || '?');
+      const rangeStr = ptoRangeStr(p);
+      const labelStr = p.label ? ` <em style="color:var(--muted);font-size:10px">(${escHtml(p.label)})</em>` : '';
+      const daysStr = p.suspicious
+        ? `<span style="color:#dc2626;font-weight:700" title="Verificar formato de fecha — n_days parece muy alto">⚠ ${p.n_days}d</span>`
+        : `${p.n_days}d`;
+      const ticketBadge = isDate
+        ? '<span style="background:#dbeafe;color:#1e40af;padding:1px 6px;border-radius:3px;font-size:10px;font-weight:600">→ crear ticket</span>'
+        : '<span style="background:#fef3c7;color:#92400e;padding:1px 6px;border-radius:3px;font-size:10px;font-weight:600">confirmar fechas</span>';
+      const fmtTag = emp.format === 'A'
+        ? '<span style="color:#0369a1;font-size:11px">A</span>'
+        : '<span style="color:#7c3aed;font-size:11px">B</span>';
+      allPtoRows.push(`<tr>
+        <td style="font-weight:600;font-size:12px">${emp.eid}</td>
+        <td>${fmtTag}</td>
+        <td style="font-size:12px">${rangeStr}${labelStr}</td>
+        <td style="text-align:center;font-size:12px">${daysStr}</td>
+        <td style="font-size:12px">${periodo ? `<span style="background:#ede9fe;color:#5b21b6;padding:1px 5px;border-radius:3px;font-size:11px">${periodo}</span>` : '—'}</td>
+        <td>${ticketBadge}</td>
+      </tr>`);
+    }
+    for (const seg of emp.unparsed_segments) {
+      allPtoRows.push(`<tr style="background:#fef2f2">
+        <td style="font-weight:600;font-size:12px">${emp.eid}</td>
+        <td><span style="color:#0369a1;font-size:11px">${emp.format}</span></td>
+        <td style="font-size:12px;color:#dc2626;font-style:italic">${escHtml(seg)}</td>
+        <td style="text-align:center">—</td>
+        <td>—</td>
+        <td><span style="background:#fee2e2;color:#991b1b;padding:1px 6px;border-radius:3px;font-size:10px;font-weight:600">revisión manual</span></td>
+      </tr>`);
+    }
+  }
+
+  el.innerHTML = `
+    <h2 style="margin-bottom:12px">Flujo de migración de PTOs</h2>
+
+    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px;margin-bottom:20px">
+      <div class="card accent"><div class="value">${totalPtos}</div><div class="label">PTOs parseados</div></div>
+      <div class="card" style="border-left:3px solid #3b82f6"><div class="value" style="color:#1e40af">${totalDateBased}</div><div class="label">Con fecha exacta</div></div>
+      <div class="card warn"><div class="value">${totalPeriodBased}</div><div class="label">Solo período (sin fecha)</div></div>
+      <div class="card red"><div class="value">${totalUnparsed}</div><div class="label">Sin parsear</div></div>
+      ${totalSuspicious > 0 ? `<div class="card red"><div class="value">${totalSuspicious}</div><div class="label">⚠ Fecha sospechosa</div></div>` : ''}
+    </div>
+
+    <div style="background:#fffbeb;border:1px solid #fde68a;border-radius:10px;padding:16px 20px;margin-bottom:20px">
+      <h3 style="font-size:13px;font-weight:700;margin-bottom:10px;color:#92400e">Reglas de migración — leer antes de correr</h3>
+      <ol style="padding-left:20px;font-size:13px;line-height:2;color:var(--text)">
+        <li><strong>NO sobreescribir PTOs existentes</strong>: antes de crear, verificar con <code>GET /api/tickets?eid=X</code> si ya existe un ticket <code>type=pto</code> para ese EID en ese rango de fechas.</li>
+        <li><strong>Con fecha exacta (Fmt B → azul)</strong>: <code>POST /api/tickets</code> con <code>type="pto"</code>, EID, start_date, end_date, status="Abierto" → luego <code>PATCH /api/tickets/{id}</code> con <code>status="Approved"</code> para que el recalculo aplique los días.</li>
+        <li><strong>Solo período (Fmt A → amarillo)</strong>: confirmar fechas exactas con el empleado o manager. Recién después crear + aprobar el ticket.</li>
+        <li><strong>Sin parsear (rojo)</strong>: texto libre no interpretable. Revisión manual obligatoria.</li>
+        <li><strong>⚠ Fecha sospechosa</strong>: n_days muy alto (probable bug de formato DD/MM vs M/D). Validar la fecha antes de crear el ticket.</li>
+      </ol>
+    </div>
+
+    ${allPtoRows.length === 0 ? '<p style="color:var(--muted)">Sin PTOs detectados.</p>' : `
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>EID</th><th>Fmt</th><th>Fechas / descripción</th>
+            <th style="text-align:center">Días</th><th>Período</th><th>Acción</th>
+          </tr>
+        </thead>
+        <tbody>${allPtoRows.join('')}</tbody>
+      </table>
+    </div>`}
   `;
 }
 
@@ -1253,6 +1570,7 @@ document.addEventListener('DOMContentLoaded', () => {
   renderTable(DATA.employees);
   renderCatalog();
   renderPeriodSummary();
+  renderPtoMigration();
   renderIssues();
 
   document.getElementById('filter-eid').addEventListener('input', applyFilters);
@@ -1266,8 +1584,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
 
 def generate_html(employees, period_order, issues, source_file, target_pct=87.0):
+    employees = enrich_ptos_with_periods(employees, period_order)
     summary = compute_summary(employees, issues)
     period_agg = compute_period_aggregates(employees, period_order)
+    offering_agg = compute_offering_aggregates(employees, period_order)
     catalog_offerings, catalog_clients = compute_catalog_preview(employees)
     data = {
         "source_file":        os.path.basename(source_file),
@@ -1275,6 +1595,7 @@ def generate_html(employees, period_order, issues, source_file, target_pct=87.0)
         "employees":          employees,
         "periods":            period_order,
         "period_agg":         period_agg,
+        "offering_agg":       offering_agg,
         "target_pct":         target_pct,
         "catalog_offerings":  catalog_offerings,
         "catalog_clients":    catalog_clients,
