@@ -341,10 +341,10 @@ async def create(body: PPACreate, created_by: str, request_id: str) -> dict:
                 INSERT INTO tickets (
                     type, eid, detail, status, date, created_by,
                     hours_to_move, hours_chargeable, hours_standard, hours_sah,
-                    from_period, to_period, scenario_type
+                    from_period, to_period, scenario_type, ppa_log_id
                 ) VALUES (
                     'ppa', $1, $2, 'Open', CURRENT_DATE, $3,
-                    $4, $5, $6, $7, $8, $9, 'assumption'
+                    $4, $5, $6, $7, $8, $9, 'assumption', $10
                 )
                 """,
                 body.eid,
@@ -356,6 +356,7 @@ async def create(body: PPACreate, created_by: str, request_id: str) -> dict:
                 body.hours_sah,
                 body.from_period,
                 body.to_period,
+                int(ppa_log_id),
             )
     return {"ok": True, "id": ppa_log_id}
 

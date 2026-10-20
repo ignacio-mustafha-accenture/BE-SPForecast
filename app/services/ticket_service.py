@@ -121,7 +121,8 @@ async def _fetch_full_ticket(conn, ticket_id: str) -> dict:
                COALESCE(t.scenario_type, 'assumption') AS scenario_type,
                t.effectivization_date::text AS effectivization_date,
                COALESCE(emp.name, t.nj_name) AS eid_name,
-               COALESCE(emp.country, emp.location) AS eid_country
+               COALESCE(emp.country, emp.location) AS eid_country,
+               t.ppa_log_id::text AS ppa_log_id
         FROM tickets t
         LEFT JOIN employees e   ON t.created_by = e.eid
         LEFT JOIN users u       ON u.email = t.created_by
@@ -148,19 +149,24 @@ async def get_ticket(ticket_id: int) -> dict:
                    t.effectivization_date::text AS effectivization_date,
                    COALESCE(emp.name, t.nj_name) AS eid_name,
                    COALESCE(emp.country, emp.location) AS eid_country,
-                   CASE WHEN t.type = 'ppa' THEN (
-                       SELECT pl.id::text FROM ppa_log pl
-                       WHERE pl.eid = t.eid
+                   CASE WHEN t.type = 'ppa' THEN COALESCE(t.ppa_log_id, (
+                       SELECT pl.id FROM ppa_log pl
+                       WHERE t.ppa_log_id IS NULL
+                         AND pl.eid = t.eid
                          AND pl.from_period = t.from_period
                          AND pl.to_period = t.to_period
                        ORDER BY pl.created_at DESC LIMIT 1
-                   ) END AS ppa_log_id,
+                   ))::text END AS ppa_log_id,
                    CASE WHEN t.type = 'ppa' THEN (
                        SELECT pl.status FROM ppa_log pl
-                       WHERE pl.eid = t.eid
-                         AND pl.from_period = t.from_period
-                         AND pl.to_period = t.to_period
-                       ORDER BY pl.created_at DESC LIMIT 1
+                       WHERE pl.id = COALESCE(t.ppa_log_id, (
+                           SELECT pl2.id FROM ppa_log pl2
+                           WHERE t.ppa_log_id IS NULL
+                             AND pl2.eid = t.eid
+                             AND pl2.from_period = t.from_period
+                             AND pl2.to_period = t.to_period
+                           ORDER BY pl2.created_at DESC LIMIT 1
+                       ))
                    ) END AS ppa_log_status
             FROM tickets t
             LEFT JOIN employees e   ON t.created_by = e.eid
@@ -547,17 +553,24 @@ async def _apply_approval_side_effects(conn, ticket: dict, request_id: str):
         await _ppa._apply_ppa_to_daily_hours(conn, eid, from_period, to_period, hours_chargeable, hours_standard, country)
         if hours_sah:
             await _ppa._apply_sah_to_daily_hours(conn, eid, from_period, to_period, hours_sah, country)
-        await conn.execute(
-            """
-            UPDATE ppa_log SET status='approved', resolved_at=NOW(), resolved_by=$1
-            WHERE id = (
-                SELECT id FROM ppa_log
-                WHERE eid=$2 AND from_period=$3 AND to_period=$4 AND status='pending'
-                ORDER BY created_at DESC LIMIT 1
+        if ticket.get("ppa_log_id"):
+            await conn.execute(
+                "UPDATE ppa_log SET status='approved', resolved_at=NOW(), resolved_by=$1 WHERE id=$2",
+                request_id, int(ticket["ppa_log_id"]),
             )
-            """,
-            request_id, eid, from_period, to_period,
-        )
+        else:
+            # Ticket sin ppa_log_id (sin backfillear): match difuso legacy
+            await conn.execute(
+                """
+                UPDATE ppa_log SET status='approved', resolved_at=NOW(), resolved_by=$1
+                WHERE id = (
+                    SELECT id FROM ppa_log
+                    WHERE eid=$2 AND from_period=$3 AND to_period=$4 AND status='pending'
+                    ORDER BY created_at DESC LIMIT 1
+                )
+                """,
+                request_id, eid, from_period, to_period,
+            )
         logger.bind(request_id=request_id).info("ppa applied on ticket approval", eid=eid)
 
 
@@ -667,7 +680,13 @@ async def reject_ticket(ticket_id: int, reason: str, request_id: str) -> dict:
             if not row:
                 raise ForecastException(AppError.TICKET_NOT_FOUND)
             ticket = await _fetch_full_ticket(conn, row["id"])
-            if ticket.get("type") == "ppa" and ticket.get("eid"):
+            if ticket.get("type") == "ppa" and ticket.get("ppa_log_id"):
+                await conn.execute(
+                    "UPDATE ppa_log SET status='rejected', rejection_reason=$1, resolved_at=NOW() WHERE id=$2",
+                    reason, int(ticket["ppa_log_id"]),
+                )
+            elif ticket.get("type") == "ppa" and ticket.get("eid"):
+                # Ticket sin ppa_log_id (sin backfillear): match difuso legacy
                 await conn.execute(
                     """
                     UPDATE ppa_log SET status='rejected', rejection_reason=$1, resolved_at=NOW()
