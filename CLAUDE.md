@@ -221,6 +221,8 @@ app.add_middleware(RequestIDMiddleware)    # 1st — innermost, runs first
 #### Employees `/api/employees`
 | Method | Path | Permission | Description |
 |---|---|---|---|
+| GET | `/unassigned` | state:read | Desasignados y proximos a liberarse (filtros, `group`, orden y paginacion server-side, `counts` por grupo) |
+| GET | `/pto` | state:read | PTOs (tabla `absences`, `type` sin distinguir mayusculas). Sin `status` devuelve en curso + proximos; `status=current\|upcoming\|past` filtra, `past` es el historial (mas reciente primero). Params: `country, cl, offering, q, page, page_size (<=200), sort (name\|country\|level\|start\|end\|hours\|status), dir`. Respuesta `{items, total, page, page_size, pages, counts{current,upcoming,past}}` |
 | PATCH | `/{eid}` | employees:update | Update employee |
 
 **Update body (all optional):**
@@ -326,4 +328,7 @@ The version is displayed in the navbar user menu dropdown (`UserMenu.tsx` reads 
 - Self-referential FK on `employees.people_lead` — insert with NULL first, then UPDATE
 - `recalculate_forecast_period(eid, period_name)` stored proc must be called sequentially (never parallel)
 - `/api/recalculate/employee/{eid}` route must be declared BEFORE `/{period_name}` to avoid routing conflict
+- En `/api/employees`, las rutas fijas (`/unassigned`, `/pto`, `/on-pto`, `/totals`) se declaran ANTES de `/{eid}`
+- `absences.type` tiene mezcla de `'PTO'` (la app) y `'pto'` (`scripts/migrate_sp_control.py`): comparar siempre con `UPPER(a.type) = 'PTO'`
+- `uvicorn` local sin `--reload` no toma cambios de codigo: si un endpoint nuevo da "Sin datos" en el front, reiniciar el backend
 - bcrypt 5.x is incompatible with passlib — use `import bcrypt` directly

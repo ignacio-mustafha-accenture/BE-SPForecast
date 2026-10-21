@@ -390,6 +390,124 @@ async def list_unassigned(
     }
 
 
+# Whitelist de orden: clave publica -> expresion SQL (sobre el CTE 'base')
+_PTO_SORT = {
+    "name": "name",
+    "country": "country",
+    "level": "level_num",
+    "start": "start_date",
+    "end": "end_date",
+    "hours": "hours",
+    "status": "status",
+}
+
+# Un PTO por fila de absences. 'type' se compara en mayuscula: la app escribe 'PTO' pero
+# la migracion de sp_control inserta 'pto'. 'where' trae los filtros de empleado.
+_PTO_BASE = """
+    WITH latest_fu AS (
+        SELECT DISTINCT ON (eid) * FROM forecast_update ORDER BY eid, updated_at DESC NULLS LAST
+    ),
+    base AS (
+        SELECT
+            a.id AS pto_id,
+            e.eid, e.name,
+            COALESCE(e.country, e.location) AS country,
+            CAST(e.cl AS NUMERIC) AS level_num,
+            fu.client AS client,
+            a.start_date, a.end_date, a.hours,
+            CASE WHEN a.end_date < CURRENT_DATE THEN 'past'
+                 WHEN a.start_date <= CURRENT_DATE THEN 'current'
+                 ELSE 'upcoming' END AS status
+        FROM absences a
+        JOIN employees e ON e.eid = a.eid
+        LEFT JOIN latest_fu fu ON fu.eid = e.eid
+        WHERE UPPER(a.type) = 'PTO'
+          AND (e.termination_date IS NULL OR e.termination_date > CURRENT_DATE)
+          AND {where}
+    )
+"""
+
+
+async def list_ptos(
+    country: str | None,
+    cl: str | None,
+    offering: str | None,
+    q: str | None,
+    status: str | None,
+    page: int,
+    page_size: int,
+    sort: str | None,
+    direction: str,
+) -> dict:
+    conditions, params = build_employee_filters(country, cl, q, None, offering=offering)
+    base_sql = _PTO_BASE.format(where=" AND ".join(conditions))
+
+    order_dir = "DESC" if direction == "desc" else "ASC"
+    sort_col = _PTO_SORT.get(sort or "")
+    if sort_col:
+        order_by = f"{sort_col} {order_dir} NULLS LAST, start_date ASC, name ASC"
+    elif status == "past":
+        # Historial: lo mas reciente primero
+        order_by = "start_date DESC, name ASC"
+    else:
+        order_by = "start_date ASC, name ASC"
+
+    list_params = list(params)
+    status_cond = ""
+    if status:
+        list_params.append(status)
+        status_cond = f"WHERE status = ${len(list_params)}"
+    else:
+        # Sin filtro: solo en curso y proximos; el historial se pide con status=past
+        status_cond = "WHERE status <> 'past'"
+    list_params.append(page_size)
+    limit_idx = len(list_params)
+    list_params.append((page - 1) * page_size)
+    offset_idx = len(list_params)
+
+    async with db.pool.acquire() as conn:
+        rows = await conn.fetch(f"""
+            {base_sql}
+            SELECT
+                pto_id AS "ID",
+                eid AS "EID",
+                name AS "Name",
+                country AS "Country",
+                CASE WHEN level_num IS NOT NULL THEN CAST(level_num AS INTEGER)::text END AS "CL",
+                client AS "Client",
+                TO_CHAR(start_date,'DD/MM/YY') AS "Start",
+                TO_CHAR(end_date,'DD/MM/YY') AS "End",
+                hours AS "Hours",
+                status AS "Status",
+                COUNT(*) OVER () AS _total
+            FROM base
+            {status_cond}
+            ORDER BY {order_by}
+            LIMIT ${limit_idx} OFFSET ${offset_idx}
+        """, *list_params)
+        # Conteos por estado con los mismos filtros, ignorando 'status'
+        count_rows = await conn.fetch(
+            f"{base_sql} SELECT status, COUNT(*) AS n FROM base GROUP BY status", *params
+        )
+
+    total = int(rows[0]["_total"]) if rows else 0
+    items = []
+    for r in rows:
+        row = dict(r)
+        row.pop("_total", None)
+        items.append(row)
+
+    counts = {"current": 0, "upcoming": 0, "past": 0}
+    for r in count_rows:
+        counts[r["status"]] = int(r["n"])
+
+    pages = -(-total // page_size) if page_size > 0 else 0
+    return {
+        "items": items, "total": total, "page": page, "page_size": page_size,
+        "pages": pages, "counts": counts,
+    }
+
+
 async def get_employees_on_pto() -> list:
     async with db.pool.acquire() as conn:
         rows = await conn.fetch("""
